@@ -1,0 +1,108 @@
+    
+
+    
+    
+        NOTE: usb_testing is NOT for general consumption...
+        #############################################################
+
+
+        https://forum.openwrt.org/t/rpi4-community-build/69998/502?u=wulfy23
+
+
+
+best tried on a new usb/mmc disk ( it is not specific to usb and makes the disk pluggable either way  )... or dd backup your mmc if you are game to sysupgrade over that... ( due to cmdline.txt being part of the backup... you'd have to update your root=PARTUUID=ABCDEFGH-02 this is not mandatory and only really help is the disk is inserted / copied to a non-mmc slot  )
+
+
+
+
+
+            -experts or separate disk + serial ideal
+            -dd backups of your existing disks should be made
+             if applying to previous installs
+
+
+            -during beta/testing advise not to put two disks in at once...
+
+            -best flashed to a new disk... (but sysupgrade capable with hand edit of cmdline.txt)
+
+            -note: on usb2 flashing takes approx 12mins + 3mins for firstboot init
+             ( approx 3xslower dont have usb3-disk to test with )
+             correction... that was a usb3-sdreader... usb3-ssd@5years old is comparable to mmc
+             read seems faster
+
+            -if you restore config files... do not restore cmdline.txt ( clone/setup root=PARTUUID= )
+
+            -if you use sysupgrade on your existing mmc... optional but recommended to update your
+                 cmdline.txt also to root=PARTUUID= AND make a 'dd' dump+backup of your mmc card
+                 in it's original state
+            
+            -also recommended to have serial access just in case ( will be needed for debugging/support )
+                
+            -fwiw my boot order is inverted to try usb first then mmc (0xf14)
+            
+            -any requests for support should state if you used factory/sysupgrade
+                 what your cmdline.txt/partuuid was prior to install and currently
+                 console boot output and your firmware version
+
+
+
+    ################################################ cmdline.txt restore caveat 2.7.23+
+
+    if you restore a backup from a different 'disk' (factory) you will need to
+    check / manually repair /boot/cmdline.txt root= prior to reboot if it is
+    set to PARTUUID or you will be using the new disk as alternate usb/mmc
+
+    short term I recommend not intermixing backups per disk
+    ( use a new and preferably different build for usb )
+
+    or if you never intend to use usb you can change the cmdline.txt back to
+    root=/dev/mmcblk0p2
+
+    vice versa if you are switching to usb you should update your root=PARTUUID
+    to that of the disk prior to unplugging / dd in this case you should only
+    have one instance of that disk plugged in at a time... 
+
+
+    ################################################ uuid(real) caveat
+
+    not yet writing new real UUID so you may need to do that if you
+    have config/fstab mounts and mmc + usb installs plugged
+    in at the same time
+
+
+
+
+
+    ######################## minimal-migration list
+
+
+/etc/passwd
+/etc/shadow
+/etc/group
+/etc/uhttpd.crt
+/etc/uhttpd.key
+/etc/config/network
+/etc/config/dhcp
+/etc/config/sqm #adblock banip etc
+/etc/config/system #optional
+/etc/config/fstab #optional
+/etc/dropbear/
+/root/.ssh
+/root/wrt.ini
+
+#/etc/packagesinstall.txt
+#/etc/packagesremove.txt
+#/etc/luciqrcodes.txt
+#/boot/plog
+#/tmp/rrd
+#var nlwmon
+#/etc/inittab
+
+
+
+
+
+
+
+
+

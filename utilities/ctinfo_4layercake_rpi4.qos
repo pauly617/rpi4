@@ -1,0 +1,3905 @@
+#!/bin/sh
+#for color
+
+
+
+
+
+
+
+################################################################################### ORIGINAL@LDIR
+################################################################################### ORIGINAL@LDIR
+################################################################################### ORIGINAL@LDIR
+# This program is free software; you can redistribute it and/or modify it under
+# the terms of the GNU General Public License version 2 as published by the
+# Free Software Foundation.
+#
+# Copyright (C) 2012-5 Michael D. Taht, Toke Høiland-Jørgensen, Sebastian
+# Moeller Additional hackery & standing on shoulders of giants (C) 2019 Kevin
+# Darbyshire-Bryant
+#
+# This script is offered on the basis that it works for me and might be useful
+# to others, but if it breaks you may keep all the pieces at no cost :-)
+#
+# diffserv5 takes advantage of a patched CAKE diffserv5 mode offering 5 tins of
+# classification Least Effort, Bulk, Best Effort, Video, Voice.
+# The difference between diffserv4 & diffserv5 is that diffserv5 has a tin for
+# Least Effort, whilst diffserv4 maps Least Effort into Bulk.  Thus diffserv4
+# treats my bittorrent as equal priority to my backups.  Bittorrent can wait,
+# my backups must complete
+#
+# By default CAKE uses DSCP values as a key into the priority tins.
+# Applications that set a DSCP (eg dropbear ssh) should have that
+# respected/used.  CAKE offers other tin keying methods eg. fwmark.  This (by
+# design) ignores any DSCP values, so if you wanted DSCP to have influence whilst
+# using that you
+# would have to write many x_tables rules to translate DSCP to tin (ie
+# emulating the lookup cake already has)  For this reason I use DSCP as the tin
+# priority key mechanism.
+#
+# DSCP values on egress are easy to find & manipulate.  Ingress is harder
+# because CAKE has already handled the packet before x_tables gets a chance to
+# see it.  An initial idea & solution for this 'ingress classification' problem
+# is to use a tc action called 'connmark'.  This restores the firewall
+# connection mark into the packet and CAKE can be told to look at this restored
+# mark for tin selection.  Events turned out that the initial plans I had for
+# 'fwmark' got neutered and whilst fwmark exists and works, I've chosen not to
+# use it for this solution. (The initial plan was to get CAKE to store the
+# chosen tin selected by DSCP into the fwmark itself, but qdiscs updating conntrack is regarded
+# as a layering violation so is a no no, it worked well but upstream didn't
+# like it)
+#
+# What I really wanted to do was store the DSCP value for a connection into the
+# firewall and use that stored DSCP as the key.  Storing DSCP on egress and
+# restoring on ingress was potentially more useful to other qdiscs not just
+# CAKE as well.
+#
+# act_ctinfo was written and is in kernel 5.3,  This restores a firewall stored
+# DSCP value into a packet's DSCP field.  The companion 'store' function has
+# not yet made it upstream, being somewhat stalled by my bad C and requirement
+# for an nftables implementation and I quite frankly have no idea how to write
+# for nftables.  A 'hacked' together implementation for iptables does exist and
+# that's what is used here.
+#
+# This script implements a 'dual level' of classification setting.  The 'hard'
+# or fixed layer applies fixed DSCP settings to known host/port combinations.
+# Traffic that isn't in this known set of rules, has a default Best Effort
+# classification and exceeds CONNB bytes transferred is then hooked by a second
+# rules set where it is demoted to BULK.
+#
+# How it works
+#
+# We usurp top byte of the firewall connmark for our own purposes.
+# bits 3-8 = DSCP
+# bit  2   = DSCPS flag - DSCP is stored in bits 3-8 but may be changed (0x02)
+# bit  1   = DSCPF flag - DSCP is long-term fixed (0x01)
+#
+# egress packets are hooked by an iptables rule if DSCPS & DSCPF unset and are
+# passed to a 'hard' hosts/port ruleset chain.  This chain sets any applicable
+# DSCP in the packet and then uses connmark savedscp to store that set DSCP
+# value along with a set DSCPS bit in the firewall connmark.  another rule
+# hooks packets that have DSCPS set, DSCPF unset and a conntrack connbytes
+# value bigger than CONNB.  These are sent to the dynamic ruleset chain.  The
+# dynamic ruleset chain changes connections that are currently Best Effort to
+# BULK and sets DSCPF
+#
+# ctinfo instances are set on both ingress and egress paths.  The ingress path
+# is hopefully obvious but ctinfo on egress may not be quite so obvious to
+# understand.  It is there to copy the previously set DSCP value to all
+# corresponding egress packets and thus eliminate the requirement for each
+# packet to pass through the 'hard' ruleset.
+#
+# More rubbish/info.  jump -j vs goto -g in iptables rules
+# jump is a bit like a subroutine, in other words unless the 'jumped' to
+# table drops or accepts a packet, the return from that sub-chain comes
+# back to the calling chain just after the point where we jumped(called)
+# the sub-chain.
+# goto goes to the called chain, and when it returns it returns to the chain
+# that called us.
+# I make use of both
+#
+# Probably a slightly more computer science description:
+# A 'jump' pushes a return chain address on to a stack, hence when the called chain
+# finishes it knows where to return to.
+# A 'goto' doesn't push a return chain address so when the called chain returns it
+# returns to the chain that called us, not our current chain.
+########################################################################################## END-ORIGINAL-COMMENT
+################################################################################### ORIGINAL@LDIR
+################################################################################### ORIGINAL@LDIR
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+##############ORIGINAL
+. /lib/functions/network.sh
+. ${SQM_LIB_DIR}/defaults.sh
+
+
+QDISC=cake
+##############O???
+DURUP=30
+DURDN=30
+########################### below is simplified Rate * 1000 * duration / 8 ie 1000/8 = 125
+CONNBDN=$(( ${DOWNLINK} * 125 * ${DURDN} ))
+CONNBUP=$(( ${UPLINK}   * 125 * ${DURUP} ))
+##########################
+INGRESS_CAKE_OPTS="diffserv8" #INGRESS_CAKE_OPTS="diffserv4"
+EGRESS_CAKE_OPTS="diffserv8" #EGRESS_CAKE_OPTS="diffserv4"
+
+
+
+
+
+#/usr/lib/sqm/defaults.sh:[ -z "$TARGET"  ] && TARGET="5ms"
+
+
+
+
+network_get_subnet SUBNET lan
+network_find_wan6 ifc_wan6 && network_get_prefix6 PREFIX "${ifc_wan6}"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+egress() {
+
+    
+    
+    
+    
+    SILENT=1 $TC qdisc del dev $IFACE root
+    $TC qdisc add dev $IFACE root cake bandwidth ${UPLINK}kbit \
+	    $( get_cake_lla_string ) ${EGRESS_CAKE_OPTS} ${EQDISC_OPTS}
+
+    echo "$TC qdisc add dev $IFACE root cake bandwidth ${UPLINK}kbit \
+	    $( get_cake_lla_string ) ${EGRESS_CAKE_OPTS} ${EQDISC_OPTS}"
+
+
+
+
+    # Put an action on the egress interface to set DSCP from the stored connmark.
+    # This seems counter intuitive but it ensures once the mark is set that all
+    # subsequent egress packets have the same stored DSCP avoiding the need to have
+    # iptables rules mark every packet.
+
+
+    $TC filter add dev $IFACE protocol all u32 \
+	match u32 0 0 \
+	action ctinfo dscp 0xfc000000 0x02000000
+
+
+
+
+}
+
+
+
+
+
+
+
+
+ingress() {
+
+    SILENT=1 $TC qdisc del dev $IFACE handle ffff: ingress
+    $TC qdisc add dev $IFACE handle ffff: ingress
+
+    SILENT=1 $TC qdisc del dev $DEV root
+
+
+
+    [ "$ZERO_DSCP_INGRESS" -eq "1" ] && INGRESS_CAKE_OPTS="$INGRESS_CAKE_OPTS wash"
+
+
+
+    $TC qdisc add dev $DEV root cake bandwidth ${DOWNLINK}kbit \
+	    $( get_cake_lla_string ) ${INGRESS_CAKE_OPTS} ${IQDISC_OPTS}
+    
+    
+    echo "$TC qdisc add dev $DEV root cake bandwidth ${DOWNLINK}kbit \
+	    $( get_cake_lla_string ) ${INGRESS_CAKE_OPTS} ${IQDISC_OPTS}"
+
+
+
+    $IP link set dev $DEV up
+
+    # redirect all IP packets arriving in $IFACE to ifb0
+    # set DSCP from conntrack mark
+    $TC filter add dev $IFACE parent ffff: protocol all u32 \
+	match u32 0 0 \
+	action ctinfo dscp 0xfc000000 0x02000000 \
+	action mirred egress redirect dev $DEV
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ipset_do() {
+
+    local listCOUNT=
+
+    case "$1" in
+    flush)
+
+        if ! ipset -n list | grep -q "^${2}$"; then
+            echL "Flushing $2 [nolist]"; return 0
+        fi
+
+
+        listCOUNT=$(ipset -L "${2}" 2>/dev/null | grep -A6000 'Members' 2>/dev/null | grep -v '^Members:' | wc -l)
+        if [ "$listCOUNT" -gt 0 ]; then
+            echL "Flushing $2 [$listCOUNT]"
+            ipset flush $2
+        else
+            #echL "Flushing $2 [${listCOUNT}-noentries]"
+            [ -n "$DEBUG" ] && echL "Flushing $2 [${listCOUNT}-noentries]"
+        fi
+        #if [ "$(ipset -L "${2}" 2>/dev/null | grep -A6000 'Members' 2>/dev/null | wc -l)" -gt 0 ]; then
+        #    listCOUNT=$(ipset -L "${2}" 2>/dev/null | grep -A6000 'Members' 2>/dev/null | wc -l)
+    ;;
+    esac
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+dynamicipset_setup() { #!NB: veth0? vs eth0?
+
+
+	#local sLBL="wasconsoles" #local sLBL="monuncommon"
+
+	local FN="dynamicipset_setup"
+
+	#echL "$FN> populate $sLBL*traf ipsets LEARNCONNECTIONS:${DSCPMONLEARNCONNECTIONS:-off}"; sleep ${RCSLEEP:-0}
+
+
+
+
+
+    if [ "$1" = "flush" ]; then
+
+
+        ###############################################################################
+        while read THIS RULE; do
+            [ -z "$RULE" ] && continue
+            [ -n "$DEBUG" ] && echL "iptables -t mangle -D $RULE"
+            iptables -t mangle -D $RULE
+        done <<PPP
+$(iptables-save  | grep mac-source | grep add-set | grep "$sLBL")
+PPP
+
+        while read THIS RULE; do
+            [ -z "$RULE" ] && continue
+            [ -n "$DEBUG" ] && echL "ip6tables -t mangle -D $RULE"
+            ip6tables -t mangle -D $RULE
+        done <<PPP
+$(ip6tables-save  | grep mac-source | grep add-set | grep "$sLBL")
+PPP
+#iptables-save  | grep mac-source | grep add-set | grep "$sLBL" | while read THIS RULE; do
+#ip6tables-save  | grep mac-source | grep add-set | grep "$sLBL" | while read THIS RULE; do
+
+
+        #echL "ipset flush ${sLBL}4" #ipset flush "${sLBL}4" 2>/dev/null
+        ipset_do "flush" "${sLBL}4" 2>/dev/null
+        
+        #echL "ipset flush ${sLBL}6" #ipset flush "${sLBL}6" 2>/dev/null
+        ipset_do "flush" "${sLBL}6"
+
+
+
+        return 0
+
+    fi
+    ###############################################################################
+    #[0:0] -A PREROUTING -m conntrack --ctstate NEW -m mac --mac-source AA:BB:CC:DD:EE:FF -j SET --add-set gamingdevice src --exist
+    #[8299:1147783] -A PREROUTING -m conntrack --ctstate NEW -m mac --mac-source 66:CD:C9:BC:B8:BB -j SET --add-set gamingdevice src --exist
+
+
+
+
+
+
+
+
+
+	################ THESE HOLD IPS WHICH ARE DYNAMICALLY OR STATICALLY ENTERED then are used to jump to MONdoCHAIN||action
+	
+    if ! ipset -n list | grep -q "^${sLBL}"; then
+		echL "Creating-ipsets: ${sLBL}" msg
+		ipset create ${sLBL} list:set 2>/dev/null
+    fi
+
+
+	if ! ipset -n list | grep -q "^${sLBL}4$"; then
+		echL "Creating-ipsets: ${sLBL}4 ${sLBL}" msg #echo "${sLBL}4 [missing]"; #ISSUES="${ISSUES} ${sLBL}4 missing"
+		ipset create ${sLBL}4 hash:ip family inet 2>/dev/null
+		ipset create ${sLBL} list:set 2>/dev/null
+		ipset add ${sLBL} ${sLBL}4 2>/dev/null
+
+	fi
+
+	if ! ipset -n list | grep -q "^${sLBL}6$"; then
+		echL "Creating-ipsets: ${sLBL}6 ${sLBL}" msg #echo "${sLBL}6 [missing]"; #ISSUES="${ISSUES} ${sLBL}4 missing"
+		ipset create ${sLBL}6 hash:ip family inet6 2>/dev/null
+		ipset create ${sLBL} list:set 2>/dev/null
+		ipset add ${sLBL} ${sLBL}6 2>/dev/null
+	fi
+
+
+	if [ ! -z "$ISSUES" ]; then echo "$ISSUES" && exit 0; fi
+
+
+
+
+
+
+    ############################################ NOW ADD SOME RULES to populate above set or STATIC set entries
+	if [ ! -z "$DSCPMONMACS" ]; then
+		
+		#echL "${sLBL}mac: DSCPMONMACS $DSCPMONMACS [learn-ips-6+4]" msg; #sleep 2
+	    #TOPPRINT echL "$FN> populate $sLBL*traf ipsets LEARNCONNECTIONS:${DSCPMONLEARNCONNECTIONS:-off}"; sleep ${RCSLEEP:-0}
+
+		for cMAC in $DSCPMONMACS; do
+
+
+			#echL "${sLBL}mac: $cMAC [learn-ips]" msg; #sleep 1
+			#echL "${sLBL}mac: $cMAC [learn-ips-4]" msg
+            # | cut -c1-11
+			#echL "${sLBL}mac: $cMAC [learn-ips]"
+            echL "${sLBL}mac: $(echo $cMAC | cut -c1-11) [learn-ips]"
+
+
+
+
+			iptables -t mangle -D PREROUTING -m conntrack --ctstate NEW \
+				-m mac --mac-source ${cMAC} -j SET --add-set ${sLBL} src --exist 2>/dev/null
+			iptables -t mangle -I PREROUTING -m conntrack --ctstate NEW \
+				-m mac --mac-source ${cMAC} -j SET --add-set ${sLBL} src --exist
+
+
+			#echL "${sLBL}mac: $cMAC [learn-ips-6]" msg
+			ip6tables -t mangle -D PREROUTING -m conntrack --ctstate NEW \
+				-m mac --mac-source ${cMAC} -j SET --add-set ${sLBL} src --exist 2>/dev/null
+			ip6tables -t mangle -I PREROUTING -m conntrack --ctstate NEW \
+				-m mac --mac-source ${cMAC} -j SET --add-set ${sLBL} src --exist
+
+		done
+
+	else
+		[ -n "$DEBUG" ] && echL "${sLBL}mac: DSCPMONMACS [none-learn-ips-6+4]" msg
+	fi
+
+
+
+
+
+    ###############################################################################
+    #ipt -t mangle -N QOS_MACLEARN
+    #ipt -A PREROUTING -m conntrack --ctstate NEW -j QOS_MACLEARN
+    ############################################
+    #ipt -t mangle -A QOS_MACLEARN -m mac --mac-source AA:BB:CC:DD:EE:FF -j SET --add-set gamingdevice src --exist
+    ############################################
+    #ipt -t mangle -F QOS_MACLEARN
+
+
+
+
+
+
+
+	#DSCPMONIPS_4="10.2.3.220"
+	if [ ! -z "$DSCPMONIPS_4" ]; then
+        echL "${sLBL}mac: DSCPMONIPS_4 $DSCPMONIPS_4 [learn-ips-6+4]" msg; #sleep 2
+		for cIP4 in $DSCPMONIPS_4; do
+			echL "ipsetadd ipset add ${sLBL}4 $cIP4"; #sleep 1
+			ipset add ${sLBL}4 $cIP4
+		done
+    else
+        [ -n "$DEBUG" ] && echL "DSCPMONIPS_4:${DSCPMONIPS_4:-none}"
+	fi
+
+
+	#DSCPMONIPS_6="10.2.3.220"
+	if [ ! -z "$DSCPMONIPS_6" ]; then
+        echL "${sLBL}mac: DSCPMONIPS_6 $DSCPMONIPS_6 [learn-ips-6+4]" msg; #sleep 2
+		for cIP6 in $DSCPMONIPS_6; do
+			echL "ipsetadd ipset add ${sLBL}6 $cIP6"; #sleep 1
+			ipset add ${sLBL}6 $cIP6
+		done
+    else
+        [ -n "$DEBUG" ] && echL "DSCPMONIPS_6:${DSCPMONIPS_6:-none}"
+	fi
+
+
+
+
+	if [ ! -z "$DSCPMONLEARNCONNECTIONS" ]; then
+    
+        if ! ipset -n list | grep -q "^${sLBL}traf"; then
+		    echL "Creating-ipsets: ${sLBL}traf" msg
+	        ipset create ${sLBL}traf list:set 2>/dev/null
+        fi
+
+        if ! ipset -n list | grep -q "^${sLBL}4traf"; then
+		    echL "Creating-ipsets: ${sLBL}4traf" msg
+	        ipset create ${sLBL}4traf hash:ip,port family inet 2>/dev/null
+	        ipset add ${sLBL}traf ${sLBL}4traf 2>/dev/null
+        fi
+
+        if ! ipset -n list | grep -q "^${sLBL}6traf"; then
+		    echL "Creating-ipsets: ${sLBL}6traf" msg
+	        ipset create ${sLBL}6traf hash:ip,port family inet6 2>/dev/null
+	        ipset add ${sLBL}traf ${sLBL}6traf 2>/dev/null
+        fi
+
+
+        ##########################################################################
+	    #echL "Creating-ipsets: ${sLBL}4traf ${sLBL}6traf ${sLBL}traf" msg
+	    #ipset create ${sLBL}4traf hash:ip,port family inet 2>/dev/null
+	    #ipset create ${sLBL}6traf hash:ip,port family inet6 2>/dev/null
+	    #ipset create ${sLBL}traf list:set 2>/dev/null
+	    #ipset add ${sLBL}traf ${sLBL}4traf 2>/dev/null
+	    #ipset add ${sLBL}traf ${sLBL}6traf 2>/dev/null
+        #########################################################################
+
+
+
+
+	    #@thesetwocanuse->consolestraf!~?
+	    #-A FORWARD -m set --match-set consoles4 dst -j SET --add-set consoles4traf src,src --exist
+	    #@@@CHANGETHESE... NEW ! 10.2.3.x
+
+
+
+    	iptables -D FORWARD -m set --match-set ${sLBL}4 dst -j SET --add-set ${sLBL}4traf src,src --exist 2>/dev/null
+    	ip6tables -D FORWARD -m set --match-set ${sLBL}6 dst -j SET --add-set ${sLBL}6traf src,src --exist 2>/dev/null
+
+
+	    iptables -I FORWARD -m set --match-set ${sLBL}4 dst -j SET --add-set ${sLBL}4traf src,src --exist
+	    ip6tables -I FORWARD -m set --match-set ${sLBL}6 dst -j SET --add-set ${sLBL}6traf src,src --exist
+
+
+	    if [ -n "$DEBUG" ]; then
+		    echo "dbgchecknums: iptables-save | grep consoles | grep traf"; iptables-save | grep consoles | grep traf
+		    echo "dbgchecknums: ip6tables-save | grep consoles | grep traf"; ip6tables-save | grep consoles | grep traf
+		    sleep ${RCSLEEP:-0}
+	    fi
+
+
+
+
+
+	    if [ ! -z "$DSCPMON_TRAF_IGNORE_PORTSdT" ]; then
+
+
+		    for cTRAFiP in $DSCPMON_TRAF_IGNORE_PORTSdT; do
+	
+                :
+                
+                #echL "$cTRAFIP LOGRULESNEEDFIX"
+
+			    #set -x WHOOPS WHOLE FORWARD CHAIN NEED TO SETUP BETTER PRIMARY HOOKS TO CHAIN
+			    #andorNEW
+
+			    #iptables -D FORWARD  -p tcp -m tcp --dport $cTRAFiP -j RETURN 2>/dev/null
+			    #ip6tables -D FORWARD  -p tcp -m tcp --dport $cTRAFiP -j RETURN 2>/dev/null
+			
+			    #iptables -I FORWARD  -p tcp -m tcp --dport $cTRAFiP -j RETURN 2>/dev/null
+			    #ip6tables -I FORWARD  -p tcp -m tcp --dport $cTRAFiP -j RETURN 2>/dev/null
+
+		    done
+
+
+	    fi
+			
+			#iptables -D FORWARD  -p udp -m udp --dport $cTRAFiP -j RETURN 2>/dev/null
+			#ip6tables -D FORWARD  -p udp -m udp --dport $cTRAFiP -j RETURN 2>/dev/null
+
+
+	return 0
+
+
+
+        if [ ! -z "$DSCPCONSOLELOGACCESS" ]; then
+		    echL "$FN> [on] LOG DSCPCONSOLELEARNCONNECTIONS"; sleep ${RCSLEEP:-0}
+
+		    echo "MANUALLYOFFNEEDSCLEANING@>newerfunctionDSCPLOGSTUFF"; sleep 1
+		    sleep ${RCSLEEP:-0}
+
+
+
+		#@@@!MATCH NON-ADDED-THENLOG-ONCE
+		#@i.e. -I ! match ipsettraf then log
+
+
+#iptables -t mangle -I PREROUTING -p tcp ! -d 10.2.3.1 -m conntrack --ctstate NEW  -m multiport ! --ports 138,5353,123,22,1900,80,591,8008,8080,443 -m set --match-set consoles4 src -j LOG  --log-prefix "CON4-newcon"
+#ip6tables -t mangle -I PREROUTING -p tcp -m conntrack --ctstate NEW  -m multiport ! --ports 138,5353,123,22,1900,80,591,8008,8080,443 -m set --match-set consoles6 src -j LOG --log-prefix "CON6-newcon"
+#iptables -t mangle -I PREROUTING -p udp ! -d 10.2.3.1 -m conntrack --ctstate NEW  -m multiport ! --ports 138,5353,123,22,1900,80,591,8008,8080,443 -m set --match-set consoles4 src -j LOG  --log-prefix "CON4-newcon"
+#ip6tables -t mangle -I PREROUTING -p udp -m conntrack --ctstate NEW  -m multiport ! --ports 138,5353,123,22,1900,80,591,8008,8080,443 -m set --match-set consoles6 src -j LOG --log-prefix "CON6-newcon"
+
+
+
+        fi
+
+
+
+
+
+	else
+		#echL "$FN> ENDECHOpopulate consoles*traf ipsets DSCPCONSOLELEARNCONNECTIONS=[off]"; sleep ${RCSLEEP:-0}
+		echL "$FN> populate ${sLBL}*traf DISABLED DSCPMONMACS [empty]"; sleep ${RCSLEEP:-0}
+	fi
+
+
+}
+
+
+############################################## LOGWATCH-TRAFFIX
+#iptables -t mangle -I PREROUTING -m conntrack --ctstate NEW -m set --match-set consoles4 src -j LOG  --log-prefix "CON4-newcon"
+#ip6tables -t mangle -I PREROUTING -m conntrack --ctstate NEW -m set --match-set consoles6 src -j LOG --log-prefix "CON6-newcon"
+################################################### LOGWATCH-TRAFFIX
+########@@@->not53+22_?>conditional->80:443 ! 240.x !local || -o eth1?||WANIF?
+#########-N logdscp -m limit || CONNMARKS etc.
+#########  -m multiport ! --ports 1900
+
+
+
+
+
+
+###############################################################
+#iptables -t mangle -I PREROUTING -p tcp -m conntrack --ctstate NEW  -m multiport ! --ports 22,1900,80,591,8008,8080,443 -m set --match-set consoles4 src -j LOG  --log-prefix "CON4-newcon"
+#ip6tables -t mangle -I PREROUTING -p tcp -m conntrack --ctstate NEW  -m multiport ! --ports 22,1900,80,591,8008,8080,443 -m set --match-set consoles6 src -j LOG --log-prefix "CON6-newcon"
+#iptables -t mangle -I PREROUTING -p udp -m conntrack --ctstate NEW  -m multiport ! --ports 22,1900,80,591,8008,8080,443 -m set --match-set consoles4 src -j LOG  --log-prefix "CON4-newcon"
+#ip6tables -t mangle -I PREROUTING -p udp -m conntrack --ctstate NEW  -m multiport ! --ports 22,1900,80,591,8008,8080,443 -m set --match-set consoles6 src -j LOG --log-prefix "CON6-newcon"
+
+
+#SNAKE
+########iptables -t mangle -I PREROUTING -m conntrack --ctstate NEW  -m multiport ! --ports 22,1900,80,591,8008,8080,443 -m set --match-set consoles4 src -j LOG  --log-prefix "CON4-newcon"
+########ip6tables -t mangle -I PREROUTING -m conntrack --ctstate NEW  -m multiport ! --ports 22,1900,80,591,8008,8080,443 -m set --match-set consoles6 src -j LOG --log-prefix "CON6-newcon"
+#############################SPARE
+#iptables -I FORWARD -m set --match-set consoles4 dst -j SET --add-set consoles4traf src,src --exist
+#ip6tables -I FORWARD -m set --match-set consoles6 dst -j SET --add-set consoles6traf src,src --exist
+################################################################################################3
+############## LEARNTRAFFICFROMCONSOLES
+###iptmark -p tcp -m set --match-set latsens src,dst -j DSCP --set-dscp-class CS5 -m comment --comment "latency sensitive ipset"
+###ipt6mark ! -p tcp -m set --match-set latsens6 src,dst -j DSCP --set-dscp-class CS6 -m comment --comment "latency sensitive ipset"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+teardown() {
+
+    #@@@NOTUSED@flush
+
+
+	iptables -D FORWARD -m set --match-set ${sLBL}4 dst -j SET --add-set ${sLBL}4traf src,src --exist 2>/dev/null
+	ip6tables -D FORWARD -m set --match-set ${sLBL}6 dst -j SET --add-set ${sLBL}6traf src,src --exist 2>/dev/null
+
+	for cMAC in $DSCPMONMACS; do
+			
+			echL "${sLBL}mac: TEARDOWN $cMAC [learn-ips]" msg; sleep 1
+
+			#echL "${sLBL}mac: $cMAC [learn-ips-4]" msg
+			iptables -t mangle -D PREROUTING -m conntrack --ctstate NEW \
+				-m mac --mac-source ${cMAC} -j SET --add-set ${sLBL} src --exist 2>/dev/null
+
+			#echL "${sLBL}mac: $cMAC [learn-ips-6]" msg
+			ip6tables -t mangle -D PREROUTING -m conntrack --ctstate NEW \
+				-m mac --mac-source ${cMAC} -j SET --add-set ${sLBL} src --exist 2>/dev/null
+
+	done
+
+	ipset destroy ${sLBL}traf
+	ipset destroy ${sLBL}6traf
+	ipset destroy ${sLBL}4traf
+	ipset destroy ${sLBL}
+	ipset destroy ${sLBL}6
+	ipset destroy ${sLBL}4
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+dumpdnsmasqipsetlist() {
+
+cat <<'EOF'
+################################################################################################## SQMDSCPIPSETS-START
+######################################################################################################################
+################################################################################### Latency Sensitive (gaming/voip)
+ipset=/igamecj.com/gcloudcs.com/qos.gcloud.qq.com/latsens,latsens6
+################################################################################### video/audio streams
+ipset=/zoom.us/streaming,streaming6
+################################################################ Youtube
+ipset=/googlevideo.com/*.googlevideo.com/streaming,streaming6
+ipset=/vevo.com/streaming,streaming6
+#ipset=/vevo.com/Vid4,Vid6
+################################################################ NetFlix
+ipset=/nflxvideo.net/streaming,streaming6
+#ipset=/nflxvideo.net/rangeA-netflix.cdn.enbgk.isp.sky.com/Vid4,Vid6
+################################################################ AmazonVideo
+ipset=/s3.ll.dash.row.aiv-cdn.net/d25xi40x97liuc.cloudfront.net/aiv-delivery.net/streaming,streaming6
+################################################################ Facebook
+ipset=/fbcdn.net/streaming,streaming6
+################################################################ Twitch
+ipset=/ttvnw.net/streaming,streaming6
+################################################################ VeVo
+ipset=/vevo.com/streaming,streaming6
+################################################################ Spotify
+ipset=/audio-fa.scdn.cot/streaming,streaming6
+################################################################ Deezer
+ipset=/deezer.com/streaming,streaming6
+################################################################ SoundCloud
+ipset=/sndcdn.com/streaming,streaming6
+################################################################ last.fm
+ipset=/last.fm/streaming,streaming6
+################################################################ reddit videos
+ipset=/v.redd.it/streaming,streaming6
+################################################################ twitch.tv
+ipset=/ttvnw.net/streaming,streaming6
+################################################################ abciview
+ipset=/iview.abc.net.au/streaming,streaming6
+################################################################ stan
+ipset=/play.stan.com.au/streaming,streaming6
+################################################################ disneyplus
+ipset=/disneyplus.com/streaming,streaming6
+################################################################ othersites
+ipset=/fbcdn.net/streaming,streaming6
+ipset=/ttvnw.net/streaming,streaming6
+ipset=/aiv-cdn.net/r.cloudfront.net/aiv-delivery.net/streaming,streaming6
+ipset=/vs-dash-uk-live.akamaized.net/streaming,streaming6
+ipset=/cdn.bllon.isp.sky.com/live.bidi.net.uk/streaming,streaming6
+ipset=/ssl-bbcdotcom.2cnt.net/streaming,streaming6
+ipset=/millicast.com/streaming,streaming6
+ipset=/xirsys.com/streaming,streaming6
+ipset=/audio-fa.scdn.cot/streaming,streaming6
+ipset=/sndcdn.com/streaming,streaming6
+ipset=/v.redd.it/streaming,streaming6
+ipset=/ttvnw.net/streaming,streaming6
+######################################################################################### cdn providers 
+ipset=/googletagmanager.com/googleusercontent.com/*.googleusercontent.com/google.com/fbcdn.net/*.fbcdn.net/akamaihd.net/*.akamaihd.net/whatsapp.net/*.whatsapp.net/whatsapp.com/*.whatsapp.com/www-cdn.whatsapp.net/googleapis.com/*.googleapis.com/ucy.ac.cy/1e100.net/hwcdn.net/usrcdn,usrcdn6
+########################################################################################## Bulk downloads
+############################################################# qq download
+ipset=/download.qq.com/bulk,bulk6
+############################################################# Steam Download
+ipset=/steamcontent.com/bulk,bulk6
+############################################################# PSN Download
+ipset=/gs2.ww.prod.dl.playstation.net/bulk,bulk6
+############################################################# DropBox
+ipset=/dropbox.com/dropboxstatic.com/dropbox-dns.com/log.getdropbox.com/bulk,bulk6
+############################################################# Google Drive
+ipset=/drive.google.com/drive-thirdparty.googleusercontent.com/bulk,bulk6
+############################################################# onedrive
+ipset=/1drv.ms/bulk,bulk6
+ipset=/1drv.com/bulk,bulk6
+############################################################# Google Docs
+ipset=/docs.google.com/docs.googleusercontent.com/bulk,bulk6
+############################################################# PlayStore Download
+ipset=/gvt1.com/bulk,bulk6
+############################################################# WhatsApp Files
+ipset=/mmg-fna.whatsapp.net/bulk,bulk6
+############################################################# Youtube Upload
+ipset=/upload.youtube.com/upload.video.google.com/bulk,bulk6
+############################################################# WindowsUpdate
+ipset=/windowsupdate.com/update.microsoft.com/bulk,bulk6
+ipset=/ms-acdc.office.com/bulk,bulk6
+############################################################# be
+ipset=/graph.microsoft.com/bulk,bulk6
+ipset=/web.whatsapp.com/bulk,bulk6
+############################################################# openwrt cdn downloads
+ipset=/*.fastly.net/bulk,bulk6
+ipset=/downloads.openwrt.org/bulk,bulk6
+ipset=/*.cdn.openwrt.org/bulk,bulk6
+#################################################################################################### SQMDSCPIPSETS-END
+ipset=/assetcdn.101.arenanetworks.com/gamecache4,gamecache6
+ipset=/assetcdn.102.arenanetworks.com/gamecache4,gamecache6
+ipset=/assetcdn.103.arenanetworks.com/gamecache4,gamecache6
+ipset=/live.patcher.bladeandsoul.com/gamecache4,gamecache6
+ipset=/dist.blizzard.com/gamecache4,gamecache6
+ipset=/dist.blizzard.com.edgesuite.net/gamecache4,gamecache6
+ipset=/llnw.blizzard.com/gamecache4,gamecache6
+ipset=/edgecast.blizzard.com/gamecache4,gamecache6
+ipset=/blizzard.vo.llnwd.net/gamecache4,gamecache6
+ipset=/blzddist1-a.akamaihd.net/gamecache4,gamecache6
+ipset=/blzddist2-a.akamaihd.net/gamecache4,gamecache6
+ipset=/blzddist3-a.akamaihd.net/gamecache4,gamecache6
+ipset=/blzddist4-a.akamaihd.net/gamecache4,gamecache6
+ipset=/level3.blizzard.com/gamecache4,gamecache6
+ipset=/nydus.battle.net/gamecache4,gamecache6
+ipset=/edge.blizzard.top.comcast.net/gamecache4,gamecache6
+ipset=/cdn.blizzard.com/gamecache4,gamecache6
+ipset=/cdn-11.eft-store.com/gamecache4,gamecache6
+ipset=/cl-453343cd.gcdn.co/gamecache4,gamecache6
+ipset=/cdn.homecomingservers.com/gamecache4,gamecache6
+ipset=/nsa.tools/gamecache4,gamecache6
+ipset=/pls.patch.daybreakgames.com/gamecache4,gamecache6
+ipset=/cdn1.epicgames.com/gamecache4,gamecache6
+ipset=/cdn.unrealengine.com/gamecache4,gamecache6
+ipset=/cdn1.unrealengine.com/gamecache4,gamecache6
+ipset=/cdn2.unrealengine.com/gamecache4,gamecache6
+ipset=/cdn3.unrealengine.com/gamecache4,gamecache6
+ipset=/download.epicgames.com/gamecache4,gamecache6
+ipset=/download2.epicgames.com/gamecache4,gamecache6
+ipset=/download3.epicgames.com/gamecache4,gamecache6
+ipset=/download4.epicgames.com/gamecache4,gamecache6
+ipset=/epicgames-download1.akamaized.net/gamecache4,gamecache6
+ipset=/cdn.zaonce.net/gamecache4,gamecache6
+ipset=/hirez.http.internapcdn.net/gamecache4,gamecache6
+ipset=/level3.nwhttppatch.crypticstudios.com/gamecache4,gamecache6
+ipset=/filedelivery.nexusmods.com/gamecache4,gamecache6
+ipset=/ccs.cdn.wup.shop.nintendo.com/gamecache4,gamecache6
+ipset=/ccs.cdn.wup.shop.nintendo.net/gamecache4,gamecache6
+ipset=/ccs.cdn.wup.shop.nintendo.net.edgesuite.net/gamecache4,gamecache6
+ipset=/geisha-wup.cdn.nintendo.net/gamecache4,gamecache6
+ipset=/geisha-wup.cdn.nintendo.net.edgekey.net/gamecache4,gamecache6
+ipset=/idbe-wup.cdn.nintendo.net/gamecache4,gamecache6
+ipset=/idbe-wup.cdn.nintendo.net.edgekey.net/gamecache4,gamecache6
+ipset=/ecs-lp1.hac.shop.nintendo.net/gamecache4,gamecache6
+ipset=/receive-lp1.dg.srv.nintendo.net/gamecache4,gamecache6
+ipset=/*.wup.eshop.nintendo.net/gamecache4,gamecache6
+ipset=/*.hac.lp1.d4c.nintendo.net/gamecache4,gamecache6
+ipset=/*.hac.lp1.eshop.nintendo.net/gamecache4,gamecache6
+ipset=/origin-a.akamaihd.net/gamecache4,gamecache6
+ipset=/lvlt.cdn.ea.com/gamecache4,gamecache6
+ipset=/rxp-lv.cncirc.net/gamecache4,gamecache6
+ipset=/cronub.fairplayinc.uk/gamecache4,gamecache6
+ipset=/amirror.tyrant.gg/gamecache4,gamecache6
+ipset=/mirror.usa.tyrant.gg/gamecache4,gamecache6
+ipset=/renx.b-cdn.net/gamecache4,gamecache6
+ipset=/l3cdn.riotgames.com/gamecache4,gamecache6
+ipset=/worldwide.l3cdn.riotgames.com/gamecache4,gamecache6
+ipset=/riotgamespatcher-a.akamaihd.net/gamecache4,gamecache6
+ipset=/riotgamespatcher-a.akamaihd.net.edgesuite.net/gamecache4,gamecache6
+ipset=/*.dyn.riotcdn.net/gamecache4,gamecache6
+ipset=/patches.rockstargames.com/gamecache4,gamecache6
+ipset=/gs2.ww.prod.dl.playstation.net/gamecache4,gamecache6
+ipset=/gs2.sonycoment.loris-e.llnwd.net/gamecache4,gamecache6
+ipset=/patch-dl.ffxiv.com/gamecache4,gamecache6
+ipset=/lancache.steamcontent.com/gamecache4,gamecache6
+ipset=/*.content.steampowered.com/gamecache4,gamecache6
+ipset=/content1.steampowered.com/gamecache4,gamecache6
+ipset=/content2.steampowered.com/gamecache4,gamecache6
+ipset=/content3.steampowered.com/gamecache4,gamecache6
+ipset=/content4.steampowered.com/gamecache4,gamecache6
+ipset=/content5.steampowered.com/gamecache4,gamecache6
+ipset=/content6.steampowered.com/gamecache4,gamecache6
+ipset=/content7.steampowered.com/gamecache4,gamecache6
+ipset=/content8.steampowered.com/gamecache4,gamecache6
+ipset=/cs.steampowered.com/gamecache4,gamecache6
+ipset=/steamcontent.com/gamecache4,gamecache6
+ipset=/client-download.steampowered.com/gamecache4,gamecache6
+ipset=/*.hsar.steampowered.com.edgesuite.net/gamecache4,gamecache6
+ipset=/*.akamai.steamstatic.com/gamecache4,gamecache6
+ipset=/content-origin.steampowered.com/gamecache4,gamecache6
+ipset=/clientconfig.akamai.steamtransparent.com/gamecache4,gamecache6
+ipset=/steampipe.akamaized.net/gamecache4,gamecache6
+ipset=/edgecast.steamstatic.com/gamecache4,gamecache6
+ipset=/steam.apac.qtlglb.com.mwcloudcdn.com/gamecache4,gamecache6
+ipset=/*.cm.steampowered.com/gamecache4,gamecache6
+ipset=/cdn1-sea1.valve.net/gamecache4,gamecache6
+ipset=/cdn2-sea1.valve.net/gamecache4,gamecache6
+ipset=/*.steam-content-dnld-1.apac-1-cdn.cqloud.com/gamecache4,gamecache6
+ipset=/*.steam-content-dnld-1.eu-c1-cdn.cqloud.com/gamecache4,gamecache6
+ipset=/steam.apac.qtlglb.com/gamecache4,gamecache6
+ipset=/edge.steam-dns.top.comcast.net/gamecache4,gamecache6
+ipset=/edge.steam-dns-2.top.comcast.net/gamecache4,gamecache6
+ipset=/steam.naeu.qtlglb.com/gamecache4,gamecache6
+ipset=/steampipe-kr.akamaized.net/gamecache4,gamecache6
+ipset=/steam.ix.asn.au/gamecache4,gamecache6
+ipset=/steam.eca.qtlglb.com/gamecache4,gamecache6
+ipset=/steam.cdn.on.net/gamecache4,gamecache6
+ipset=/update5.dota2.wmsj.cn/gamecache4,gamecache6
+ipset=/update2.dota2.wmsj.cn/gamecache4,gamecache6
+ipset=/update6.dota2.wmsj.cn/gamecache4,gamecache6
+ipset=/update3.dota2.wmsj.cn/gamecache4,gamecache6
+ipset=/update1.dota2.wmsj.cn/gamecache4,gamecache6
+ipset=/update4.dota2.wmsj.cn/gamecache4,gamecache6
+ipset=/update5.csgo.wmsj.cn/gamecache4,gamecache6
+ipset=/update2.csgo.wmsj.cn/gamecache4,gamecache6
+ipset=/update4.csgo.wmsj.cn/gamecache4,gamecache6
+ipset=/update3.csgo.wmsj.cn/gamecache4,gamecache6
+ipset=/update6.csgo.wmsj.cn/gamecache4,gamecache6
+ipset=/update1.csgo.wmsj.cn/gamecache4,gamecache6
+ipset=/st.dl.bscstorage.net/gamecache4,gamecache6
+ipset=/cdn.mileweb.cs.steampowered.com.8686c.com/gamecache4,gamecache6
+ipset=/live.patcher.elderscrollsonline.com/gamecache4,gamecache6
+ipset=/d3rmjivj4k4f0t.cloudfront.net/gamecache4,gamecache6
+ipset=/addons.forgesvc.net/gamecache4,gamecache6
+ipset=/media.forgecdn.net/gamecache4,gamecache6
+ipset=/files.forgecdn.net/gamecache4,gamecache6
+ipset=/*.cdn.ubi.com/gamecache4,gamecache6
+ipset=/content.warframe.com/gamecache4,gamecache6
+ipset=/dl1.wargaming.net/gamecache4,gamecache6
+ipset=/dl2.wargaming.net/gamecache4,gamecache6
+ipset=/wg.gcdn.co/gamecache4,gamecache6
+ipset=/wgusst-na.wargaming.net/gamecache4,gamecache6
+ipset=/wgusst-eu.wargaming.net/gamecache4,gamecache6
+ipset=/update-v4r4h10x.worldofwarships.com/gamecache4,gamecache6
+ipset=/wgus-wotasia.wargaming.net/gamecache4,gamecache6
+ipset=/dl-wot-ak.wargaming.net/gamecache4,gamecache6
+ipset=/dl-wot-gc.wargaming.net/gamecache4,gamecache6
+ipset=/dl-wot-se.wargaming.net/gamecache4,gamecache6
+ipset=/dl-wot-cdx.wargaming.net/gamecache4,gamecache6
+ipset=/dl-wows-ak.wargaming.net/gamecache4,gamecache6
+ipset=/dl-wows-gc.wargaming.net/gamecache4,gamecache6
+ipset=/dl-wows-se.wargaming.net/gamecache4,gamecache6
+ipset=/dl-wows-cdx.wargaming.net/gamecache4,gamecache6
+ipset=/dl-wowp-ak.wargaming.net/gamecache4,gamecache6
+ipset=/dl-wowp-gc.wargaming.net/gamecache4,gamecache6
+ipset=/dl-wowp-se.wargaming.net/gamecache4,gamecache6
+ipset=/dl-wowp-cdx.wargaming.net/gamecache4,gamecache6
+ipset=/*.windowsupdate.com/gamecache4,gamecache6
+ipset=/windowsupdate.com/gamecache4,gamecache6
+ipset=/*.dl.delivery.mp.microsoft.com/gamecache4,gamecache6
+ipset=/dl.delivery.mp.microsoft.com/gamecache4,gamecache6
+ipset=/*.update.microsoft.com/gamecache4,gamecache6
+ipset=/*.do.dsp.mp.microsoft.com/gamecache4,gamecache6
+ipset=/*.microsoft.com.edgesuite.net/gamecache4,gamecache6
+ipset=/amupdatedl.microsoft.com/gamecache4,gamecache6
+ipset=/amupdatedl2.microsoft.com/gamecache4,gamecache6
+ipset=/amupdatedl3.microsoft.com/gamecache4,gamecache6
+ipset=/amupdatedl4.microsoft.com/gamecache4,gamecache6
+ipset=/amupdatedl5.microsoft.com/gamecache4,gamecache6
+ipset=/assets1.xboxlive.com/gamecache4,gamecache6
+ipset=/assets2.xboxlive.com/gamecache4,gamecache6
+ipset=/dlassets.xboxlive.com/gamecache4,gamecache6
+ipset=/xboxone.loris.llnwd.net/gamecache4,gamecache6
+ipset=/xboxone.vo.llnwd.net/gamecache4,gamecache6
+ipset=/xbox-mbr.xboxlive.com/gamecache4,gamecache6
+ipset=/assets1.xboxlive.com.nsatc.net/gamecache4,gamecache6
+ipset=/xvcf1.xboxlive.com/gamecache4,gamecache6
+######################################################################################################################
+EOF
+
+#ipset=/wikipedia.com/wikipedia.org/wiki,wiki6
+#ipset=/*.fastly.net/bulk,bulk6
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ipsets_into_ucidnsmasq() {
+
+    local FN="ipsets_into_ucidnsmasq" #ipsetsintoucidnsmasqdirecttest()
+
+
+	local tLIST=
+	local masqL=
+	
+
+dumpdnsmasqipsetlist | grep -v '^$' | grep -v '^#' | while read tLIST; do
+	masqL=
+	masqL=$(echo $tLIST | sed 's/^ipset=//g')
+
+    
+    setNAMES=$(basename $masqL)
+    setNAMES=$(basename $setNAMES | sed 's/,/ /g')
+    #echL "setNAMEStest: $setNAMES"
+	#echo ">>>>>>>>>>>>DBG: masqL: $masqL" #uci add_list dhcp.@dnsmasq[0].ipset="/sndcdn.com/streaming,streaming6"
+
+	if uci show dhcp | grep ipset | grep -q "$masqL"; then
+        [ -n "$DEBUG" ] && echL "uci add_list dhcp.@dnsmasq[0].ipset=\"$masqL\" [present]" msg
+	else		
+		sanegrep=$(echo $masqL | sed 's!*!\\*!g')
+		if uci show dhcp | grep ipset | grep -q "$sanegrep"; then
+			[ -n "$DEBUG" ] && echL "uci add_list dhcp.@dnsmasq[0].ipset=\"$masqL\" [present-ast]" msg
+		else
+			echL "uci add_list dhcp.@dnsmasq[0].ipset=\"$masqL\" [add]" msg
+			uci add_list dhcp.@dnsmasq[0].ipset="$masqL"
+		fi
+	fi
+
+done
+
+    if [ "$(uci changes dhcp | grep 'ipset' | wc -l)" -gt 0 ]; then
+	
+        echL "dnsmasq-ipset-additions $(uci changes dhcp | grep 'ipset' | wc -l)" msg
+        uci commit dhcp
+	    /etc/init.d/dnsmasq restart
+	    #echo "#############dbg"; uci changes dhcp | grep 'ipset' #echo "#############dbg"; uci commit dhcp
+
+    else
+        [ -n "$DEBUG" ] && echL "no dnsmasq-ipset-additions" msg
+    fi
+
+
+}
+
+
+
+
+
+
+
+
+echL() {
+    
+    local MSG="${1}"; shift
+
+    case "${1}" in
+        debug) if [ ! -z "$RPI4QOS_DEBUG" ]; then echo "SQM::: $MNAME> $MSG"; fi; ;;
+        *) echo "SQM::: $MNAME> $MSG"; ;;
+    esac
+
+
+    case "${1}" in
+    log)
+        logger -t $MNAME "SQM::: $MNAME> $MSG"; return 0; ;;
+    esac
+    #if [ ! -z "$RPI4QOS_LOGGER" ]; then logger -t $MNAME "SQM::: $MNAME> $MSG"; fi
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+MNAME="ctinfo_4layercake_rpi4.qos"
+
+
+
+
+
+#echL "INGRESS_CAKE_OPTS:$INGRESS_CAKE_OPTS EGRESS_CAKE_OPTS:$EGRESS_CAKE_OPTS"
+
+
+
+
+#sLBL="monuncommon" #sets consoles4+6existorexit CAREFULLITSSTATICINFUNCTIONtmp
+#DSCPMONMACS="d4:63:c6:8f:15:e7 66:cd:c9:bc:b8:bb"
+#DSCPMONLEARNCONNECTIONS=1
+#DSCPMONIPS_4="10.2.3.220"
+#DSCPMONIPS_6="10.2.3.220"
+
+
+#DSCPMON_TRAF_IGNORE_PORTSdT #DSCPMONTRAFIGNOREPORTSdT="443"
+
+
+
+
+
+
+
+
+
+
+
+
+
+dumpdebugscript() {
+
+    if [ ! -f /bin/qosdebug.sh ]; then
+    echL "Create /bin/qosdebug.sh"
+    echL "Create /bin/qosdebug.sh"
+    echL "Create /bin/qosdebug.sh"
+
+cat <<EOF > /bin/qosdebug.sh
+#!/bin/sh
+
+echo "############ uptime $(uptime) $(date)"
+
+
+
+
+if [ "$1" = "revert" ]; then
+    cp /etc/config/.dhcp-pre-qos /etc/config/dhcp 
+    /etc/init.d/dnsmasq restart
+    /etc/init.d/firewall restart
+fi
+
+
+
+#echo "###################### tc -s qdisc"; tc -s qdisc; sleep 3
+echo "###################### tc -s qdisc | grep -A13 'Tin 0'"; tc -s qdisc | grep -A13 'Tin 0'; sleep 3
+
+
+
+echo "############ ipv4 #################"
+echo "###################### iptables-save -c | grep QOS_MARK | grep -v '0:0'"; iptables-save -c | grep QOS_MARK | grep -v '0:0'
+echo "###################### iptables-save -c | grep dscptagstatic | grep -v '0:0'"; iptables-save -c | grep dscptagstatic | grep -v '0:0'
+
+#sleep 3
+
+
+
+
+
+
+echo "############ ipv6 #################"
+echo "###################### ip6tables-save -c | grep QOS_MARK | grep -v '0:0'"; ip6tables-save -c | grep QOS_MARK | grep -v '0:0'
+echo "###################### ip6tables-save -c | grep dscptagstatic | grep -v '0:0'"; iptables-save -c | grep dscptagstatic | grep -v '0:0'
+
+#sleep 3
+
+
+
+
+echo "############ uptime $(uptime) $(date) ##############"
+
+
+
+echo "############# just-setmatches"
+( iptables-save -c | grep match-set; ip6tables-save -c | grep match-set  ) | grep -v '0:0'
+
+
+cat <<VVV
+iptables-save -c | grep match-set
+iptables-save -c | grep QOS_MARK_F_eth1
+( iptables-save -c | grep match-set; ip6tables-save -c | grep match-set  ) | grep -v '0:0'
+iptables -nvL
+#cat /etc/config/sqm
+#ifstatus wan
+#tc -d qdisc
+#tc -s qdisc
+#SQM_DEBUG=1 SQM_VERBOSITY_MAX=11 /etc/init.d/sqm stop ; SQM_DEBUG=1 SQM_VERBOSITY_MAX=11 /etc/init.d/sqm start
+################ tc qdisc add root cake help
+VVV
+
+
+#ip6tables-save -c | grep QOS_MARK_D
+
+
+
+
+
+iptables-save -c | grep -E '(\-\-ctorig|\-\-ctrep)'
+ip6tables-save -c | grep -E '(\-\-ctorig|\-\-ctrep)'
+
+
+
+
+exit 0
+
+#echo "###################### ipset -n list"; ipset -n list; sleep 3
+EOF
+chmod +x /bin/qosdebug.sh
+
+else
+    [ -n "$DEBUG" ] && echL "Create /bin/qosdebug.sh [exists]"
+fi
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#hardtotellwhichiswhich (ip6tables-save -c; iptables-save -c) | grep match-set
+#echo "###################### ipset -L ${sLBL}4"; ipset -L "${sLBL}4"
+#echo "###################### ipset -L ${sLBL}6"; ipset -L "${sLBL}6"
+#sleep 2
+####################
+#ipset -L streaming
+#tc -s qdisc
+###################### #RPTLOWER
+#echo "###################### iptables-save -c | grep QOS_MARK | grep -v '0:0'"; iptables-save -c | grep QOS_MARK | grep -v '0:0'
+############################
+#####echo "###################### ip6tables-save -c | grep MACLEARN"; ip6tables-save -c | grep MACLEARN; sleep 3
+#TOS=0x00 PREC=0x80 20
+#iptables -t mangle -A POSTROUTING -m limit --limit 2/sec -m dscp --dscp 0x20 -j LOG --log-prefix 'dscp20 '
+#iptables -t mangle -D POSTROUTING -m limit --limit 2/sec -m dscp --dscp 0x20 -j LOG --log-prefix 'dscp20 '
+
+
+
+
+
+
+
+
+
+
+
+
+
+write_rtdsfield() {
+
+if [ ! -f /etc/iproute2/rt_dsfield ]; then
+	echL "/etc/iproute2/rt_dsfield [create]" msg; sleep ${RCSLEEP:-0}
+cat <<'EOF' > /etc/iproute2/rt_dsfield
+# Differentiated field values
+# These include the DSCP and unused bits
+0x0     default
+# Newer RFC2597 values
+0x28    AF11
+0x30    AF12
+0x38    AF13
+0x48    AF21
+0x50    AF22
+0x58    AF23
+0x68    AF31
+0x70    AF32
+0x78    AF33
+0x88    AF41
+0x90    AF42
+0x98    AF43
+# Older values RFC2474
+0x20    CS1
+0x40    CS2
+0x60    CS3
+0x80    CS4
+0xA0    CS5
+0xC0    CS6
+0xE0    CS7
+# RFC 2598
+0xB8    EF
+EOF
+
+else	
+	[ -n "$DEBUG" ] && echL "/etc/iproute2/rt_dsfield [present]" msg; return 0
+fi
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+QDISCSETUP() {
+
+
+#@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@mayneedarestartiftcshowgrepeth1etc...
+#if [ "$wanifcake" = "eth0" ]; then
+#	echL "wanifcake is eth0 skipALLvethstuff NEED LOCALIGNORERULES" msg
+#else
+
+	echL "wanifcake is NOTeth0 DOvethstuff" msg
+
+if ! ip link | grep 'veth0@veth1' | grep -q 'UP'; then
+	#echo "Setting up veth interfaces..."; sleep 1
+	echo "Setting up veth interfaces..."; sleep 1
+	echo "T1"
+	ip link show | grep veth0 || ip link add type veth ## set up veth devices to handle inbound and outbound traffic
+	echo "T2"
+	ip link set veth0 up
+	echo "T3"
+	ip link set veth1 up ## get new veth interfaces up
+	echo "T5"
+	ip link set veth1 promisc on ## trun on promisc mode,sometimes it's needed to make bridge work
+fi
+
+echo "T6"
+brctl show | grep -q veth1 || brctl addif br-lan veth1 ## add veth1 to bridge
+
+
+
+
+echo "Setting up table/rule..."; sleep 1 ## just to make sure there's nothing inside this table
+ip rule del priority 100
+ip route flush table 100
+## add routing for veth0 this will handle all traffic
+ip route add default dev veth0 table 100
+ip rule add iif $IFACE table 100 priority 100
+
+#ip route show table 100 #default dev veth0 scope link 
+#ip rule show table 100 #100:	from all iif eth1 lookup 100
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+IPTBOTH() {
+
+
+    ipt ${*}
+}
+#ipt ${*}
+#ipt "${*}"
+#iptables "${*}"; ip6tables "${*}"
+
+
+
+
+
+
+
+
+ipt_setup() {
+
+
+
+
+# Configure iptables chains to mark packets
+#    ipt_destruct
+    ipt -t mangle -N QOS_CAKE_${IFACE}
+    ipt -t mangle -N QOS_MARK_F_${IFACE}
+    ipt -t mangle -N QOS_MARK_F_REMAP_${IFACE}
+    ipt -t mangle -N QOS_MARK_D_${IFACE}
+    ipt -t mangle -N QOS_MARK_D_orig_${IFACE}
+    ipt -t mangle -N QOS_MARK_D_repl_${IFACE}
+
+
+
+
+# 'non-dynamic, fixed' rules
+#
+# Change DSCP of relevant hosts/ports and save the DSCP to the connmark using savedscp
+#
+# eg.  I have a skybox which only does downloads & never streams, make it bulk
+# I have a bluray player that speaks netflix/amazon, so it streams and never downloads, make it video
+# I have a bittorrent host, so make that host/port combination bulk.
+# I have some dynamically updated ipsets filled by dnsmasq for Bulk, video & voice, so classify if they match
+# In fact since we already have the ipset based rules, just add local hosts to the relevant set.
+# Qnap have just done something interesting in that they've set DSCP LE on their Hybrid Backup Sync
+# application.  Presently I jealously guard LE for bittorrent (something I regard as lowest priority in
+# the world) thus Qnap's decision to make my backups LE as opposed to my preferred BK (bulk) meant I
+# needed to create a 'packet has a DSCP but I'd like to re-map it to something else' chain.
+
+
+
+
+
+
+
+
+
+
+
+#sLBL="monuncommon" #sets consoles4+6existorexit CAREFULLITSSTATICINFUNCTIONtmp
+sLBL="gamingdevice" #sets consoles4+6existorexit CAREFULLITSSTATICINFUNCTIONtmp
+#DSCPMONIPS_4="10.2.3.220"
+#DSCPMONIPS_6="10.2.3.220"
+#DSCPMONLEARNCONNECTIONS=1
+
+#DSCPMONTRAFIGNOREPORTSdT="443"
+#DSCP_PORTs4_TCP_CS0=""
+
+
+
+#DSCPMONMACS="aa:bb:cc:dd:ee:ff" #put gaming consoles here
+
+
+
+
+
+
+
+
+eval `grep '^RPI4QOS_DEBUG=' /root/wrt.ini 2>/dev/null`
+if [ ! -z "$RPI4QOS_DEBUG" ]; then
+    : #USEDIRECT
+else
+    : #INIMSG="${INIMSG} RPI4QOS_DEBUG[off]"; #echL "RPI4QOS_LOGGER [off]"
+fi
+
+#@echL-CURRENTLYOFF@log
+eval `grep '^RPI4QOS_LOGGER=' /root/wrt.ini 2>/dev/null`
+if [ -z "$RPI4QOS_LOGGER" ]; then INIMSG="${INIMSG} RPI4QOS_LOGGER"; fi #echL "RPI4QOS_LOGGER [off]"
+
+
+
+
+
+
+
+
+
+
+
+
+######### GAMINGPARAMS
+######### GAMINGPARAMS
+######### GAMINGPARAMS
+eval `grep '^RPI4QOS_GAMING_MACS=' /root/wrt.ini 2>/dev/null`
+if [ ! -z "$RPI4QOS_GAMING_MACS" ]; then
+    DSCPMONMACS="${RPI4QOS_GAMING_MACS}"
+else
+    INIMSG="${INIMSG} RPI4QOS_GAMING_MACS"
+fi #echL "RPI4QOS_GAMING_MACS [empty@/root/wrt.ini]"
+
+
+eval `grep '^RPI4QOS_GAMING_LEARNCONNECTIONS=' /root/wrt.ini 2>/dev/null`
+if [ ! -z "$RPI4QOS_GAMING_LEARNCONNECTIONS" ]; then
+    DSCPMONLEARNCONNECTIONS=1
+else
+    INIMSG="${INIMSG} RPI4QOS_GAMING_LEARNCONNECTIONS" #echL "RPI4QOS_GAMING_LEARNCONNECTIONS [empty@/root/wrt.ini]"
+fi; #eval `grep '^DSCPMONLEARNCONNECTIONS=' /root/wrt.ini 2>/dev/null`
+
+
+eval `grep '^RPI4QOS_GAMING_IPS_4=' /root/wrt.ini 2>/dev/null`
+if [ ! -z "$RPI4QOS_GAMING_IPS_4" ]; then
+    DSCPMONIPS_4="$RPI4QOS_GAMING_IPS_4"
+else
+    INIMSG="${INIMSG} RPI4QOS_GAMING_IPS_4" #echL "RPI4QOS_GAMING_IPS_4 [empty@/root/wrt.ini]"
+fi #DSCPMONIPS_4="10.2.3.220"
+
+eval `grep '^RPI4QOS_GAMING_IPS_6=' /root/wrt.ini 2>/dev/null`
+if [ ! -z "$RPI4QOS_GAMING_IPS_6" ]; then
+    DSCPMONIPS_6="$RPI4QOS_GAMING_IPS_6"
+else
+    INIMSG="${INIMSG} RPI4QOS_GAMING_IPS_6" #echL "RPI4QOS_GAMING_IPS_6 [empty@/root/wrt.ini]"
+fi #DSCPMONIPS_6="10.2.3.220"
+######### GAMINGPARAMS
+######### GAMINGPARAMS
+######### GAMINGPARAMS
+
+
+
+
+
+
+
+
+
+
+
+
+
+###@@@config/sqm IQDISC_OPTS="ingress"
+###@@@ip txquln = more direct/snappy when available/short but likely hangs for bulk/streams
+
+
+
+
+
+
+
+if [ ! -z "$INIMSG" ]; then #@msg? justecho
+    echL "$INIMSG [empty@/root/wrt.ini]"
+fi
+
+
+
+
+
+
+
+
+
+
+
+########### pre-setup>setup
+if [ ! -f /etc/config/.dhcp-pre-qos ]; then cp /etc/config/dhcp /etc/config/.dhcp-pre-qos; fi #@qosdebug.sh 'restore'
+dumpdebugscript #mayneediptnames-moveupandfailfriendly
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#option iqdisc_opts 'nat dual-dsthost ingress'
+
+
+
+
+
+
+
+echL "IFACE:$IFACE"
+echL "ip4>SUBNET:$SUBNET ip6> ifc_wan6:${ifc_wan6} PREFIX:$PREFIX" debug
+
+
+
+
+
+################# echL #debug = @_DEBUG #log=logonly/maybeifLOGGERISON
+######### ${INGRESS_CAKE_OPTS} ${IQDISC_OPTS} #IQDISC_OPTS="ingress" #NOPE
+
+
+
+#/usr/lib/sqm/defaults.sh:[ -z "$IQDISC_OPTS"  ] && IQDISC_OPTS=""
+#/usr/lib/sqm/run.sh:    export IQDISC_OPTS=$(config_get "$section" iqdisc_opts)
+### sqm.wan.iqdisc_opts='ingress'
+
+
+
+echL "################################## INGRESS"
+
+
+echL "IQDISC_OPTS:$IQDISC_OPTS"
+echL "INGRESS_CAKE_OPTS:$INGRESS_CAKE_OPTS"
+echL "IGNORE_DSCP_INGRESS:$IGNORE_DSCP_INGRESS ZERO_DSCP_INGRESS:$ZERO_DSCP_INGRESS"
+
+
+
+echL "THRESH CONNBDN:$CONNBDN CONNBUP:$CONNBUP"    
+#echL "DURUP:$DURUP DURDN:$DURDN CONNBDN:$CONNBDN CONNBUP:$CONNBUP"    
+#echL "DURUP:$DURUP DURDN:$DURDN" #30/30@statixcalcs
+###READABLE-BULKCALCed?#####################################################################################
+#echL "BULKishHUMANDOWN: $(( ${DOWNLINK} * ${DURDN} / 8 ))" ##CONNBDN=$(( ${DOWNLINK} * 1000 * ${DURDN} / 8 ))
+#echL "BULKishHUMANUP: $(( ${UPLINK} * ${DURDN} / 8 ))" ##CONNBUP=$(( ${UPLINK}   * 1000 * ${DURUP} / 8 ))
+#####-m connbytes --connbytes ${CONNBDN} --connbytes-dir original --connbytes-mode bytes \
+#####-m connbytes --connbytes ${CONNBUP} --connbytes-dir reply --connbytes-mode bytes \
+#######################################################################################################3
+
+
+
+
+
+
+
+
+
+#@@@??? /usr/lib/sqm/functions.sh:    # either e.g. 100ms or auto
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+echL "SHAPER_BURST_DUR_US:$SHAPER_BURST_DUR_US SHAPER_QUANTUM_DUR_US:$SHAPER_QUANTUM_DUR_US"
+echL "INGRESS_CAKE_OPTS:$INGRESS_CAKE_OPTS EGRESS_CAKE_OPTS:$EGRESS_CAKE_OPTS"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+###############################################set > /tmp/QOSSET
+###CONNBDN=$(( ${DOWNLINK} * 125 * ${DURDN} )); CONNBUP=$(( ${UPLINK}   * 125 * ${DURUP} ))
+###############################################set > /tmp/QOSSET
+#echL "DEBUG IPTABLES $IPTABLES" #DEBUG IPTABLES iptables_wrapper
+#echL "DEBUG IP6TABLES $IP6TABLES" #DEBUG IP6TABLES ip6tables_wrapper
+###############################################set > /tmp/QOSSET
+#QDISC='cake'
+#SCRIPT='ctinfo_4layercake_rpi4.qos'
+#SHAPER_BURST_DUR_US='1000' #+I
+#SHAPER_QUANTUM_DUR_US='1000' #+I
+#IGNORE_DSCP_INGRESS='1'
+#ZERO_DSCP_INGRESS='1'
+###############################################set > /tmp/QOSSET
+###############################################set > /tmp/QOSSET
+###############################################set > /tmp/QOSSET
+
+
+
+
+
+
+
+write_rtdsfield
+
+
+
+
+
+
+
+
+
+
+
+
+############ ORIGINAL_SAMPLES
+############ ORIGINAL_SAMPLES
+############ ORIGINAL_SAMPLES
+################################################################### example here if you needed to do port 'ip'sets
+#ipset -exist create AppleFT bitmap:port range 3478-16402
+#plist="3478-3497 16384-16387 16393-16402"
+#for p in $plist ; do
+#	ipset -exist add AppleFT $p
+#done
+################################################################## ipv4-hostnames->'ip'-set
+#ipset -q add Bulk4 SkyQ ############ Skybox
+#ipset -q add Vid4  bluray ########## Bluray
+#ipset -q add Vid4  av-amp ########## AV-Amp
+############ ORIGINAL_SAMPLES
+############ ORIGINAL_SAMPLES
+############ ORIGINAL_SAMPLES
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#@?add'check/setup'+call=flush-sep ### dumpdebugscript #mayneediptnames-moveupandfailfriendly
+dynamicipset_setup "flush" #this-if-for-re-runs->possiblyputinteardown-deinit-etc #@@@if? ONLYHANDLING-'GAMING'
+
+
+#-USECSMOD@ethtool
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+################################################## NONORIGINAL?(most?) NOTUSEDbyMEbutHASrulesDEPENDINGon
+ipset -q create Bulk4 hash:ip
+ipset -q create BE4 hash:ip
+ipset -q create Voice4 hash:ip
+ipset -q create Vid4 hash:ip
+ipset -q create Zoom4 hash:ip
+###
+ipset -q create Bulk6 hash:ip family inet6
+ipset -q create BE6 hash:ip family inet6
+ipset -q create Voice6 hash:ip family inet6
+ipset -q create Vid6 hash:ip family inet6
+ipset -q create Zoom6 hash:ip family inet6
+################################################## NONORIGINAL
+################################################## NONORIGINAL we need to add these ahead of dnsmasq for iptables rules to take
+################################################## NONORIGINAL
+########################################################################
+ipset -q create streaming hash:ip
+ipset -q create streaming6 hash:ip family inet6
+###
+ipset -q create bulk hash:ip
+ipset -q create bulk6 hash:ip family inet6
+###
+ipset -q create latsens hash:ip #ipset -q create latsens4 hash:ip
+ipset -q create latsens6 hash:ip family inet6
+###
+ipset -q create usrcdn hash:ip
+ipset -q create usrcdn6 hash:ip family inet6
+###### this one is pretty massive / untested / needs classify tweaking ... is it bulk/gametraf + @microsoft and overlap@other-set/s
+###########ipset create f2b-recidive -exist hash:ip hashsize 32768 maxelem 80000
+ipset -q create gamecache4 hash:ip hashsize 32768 maxelem 80000
+#ipset -q create gamecache4 hash:ip
+ipset -q create gamecache6 hash:ip family inet6
+#######################################################################
+#######################################################################
+########################################################################
+###@@@TESTMATCHCOMBINED
+###@@@TESTMATCHCOMBINED>TOGGLEDOFF@iptables
+###@@@TESTMATCHCOMBINED
+ipset -q create latsensitive list:set
+ipset -q add latsensitive latsens
+ipset -q add latsensitive latsens6
+###@@@TESTMATCHCOMBINED
+###@@@TESTMATCHCOMBINED
+###@@@TESTMATCHCOMBINED
+#######################################################################
+#######################################################################
+#######################################################################
+########################################################################NEVERUSED-PROPOSED-NAMING
+########################################################################NEVERUSED-PROPOSED-NAMING
+########################################################################NEVERUSED-PROPOSED-NAMING
+#ipset -q create sqmdscp_builtin_streaming hash:ip
+#ipset -q create sqmdscp_builtin_streaming6 hash:ip family inet6
+#@@@ latsens_portsUDP
+#@@@ latsens_portsTCP
+#@@@ latsens6_portsUDP
+#@@@ latsens6_portsTCP
+########################################################################NEVERUSED-PROPOSED-NAMING
+########################################################################NEVERUSED-PROPOSED-NAMING
+########################################################################NEVERUSED-PROPOSED-NAMING
+########################################################################NEVERUSED-PROPOSED-NAMING
+
+
+
+
+
+
+
+
+
+
+
+###@@@setup+verboseifnew HACKBELOW
+
+#INLINE-EXAMPLE_for_CLOUDFLARE4-note: 20210121 update@monthly? or call external script
+plist="103.31.4.0/22 108.162.192.0/18 131.0.72.0/22 198.41.128.0/17 103.21.244.0/22 104.16.0.0/12 162.158.0.0/15 188.114.96.0/20 172.64.0.0/13 173.245.48.0/20 141.101.64.0/18 190.93.240.0/20 103.22.200.0/22 197.234.240.0/22"
+ipset -exist create cloudflare-v4 hash:net
+for p in $plist ; do
+	ipset -exist add cloudflare-v4 $p
+done
+#INLINE-EXAMPLE_for_CLOUDFLARE6-note: 20210121 update@monthly? or call external script
+plist="2803:f800::/32 2405:8100::/32 2606:4700::/32 2405:b500::/32 2c0f:f248::/32 2400:cb00::/32 2a06:98c0::/29"
+ipset -exist create cloudflare-v6 hash:net family inet6
+for p in $plist ; do
+	ipset -exist add cloudflare-v6 $p
+done
+
+#######################################@@@testcontainer
+ipset -q create cloudflare list:set
+ipset -q add cloudflare cloudflare-v4
+ipset -q add cloudflare cloudflare-v6
+
+
+
+
+
+
+
+
+
+SONYIPv4="63.241.6.48/29
+63.241.60.40/29
+64.37.128.0/18
+69.153.161.16/28
+199.107.70.72/29
+199.108.0.0/20
+199.108.192.0/20"
+
+ipset create sony4 -exist hash:ip hashsize 32768 maxelem 80000
+for p in $SONYIPv4 ; do
+	ipset -exist add sony4 $p
+	#ipset -exist add gamecache4 $p
+done
+
+
+STEAMIPv4="24.89.185.8/29
+49.143.234.0/24
+63.98.16.176/29
+63.145.202.0/28
+63.146.183.0/26
+63.150.152.136/29
+63.224.0.0/13
+63.236.12.136/29
+63.236.79.96/29
+63.236.98.112/29
+63.236.109.96/29
+65.113.241.32/28
+65.122.178.64/28
+66.77.143.136/29
+67.132.200.128/26
+67.134.197.240/28
+67.134.199.64/28
+67.135.39.128/26
+68.142.64.0/18
+68.177.101.0/25
+69.28.128.0/18
+72.165.61.128/26
+77.67.56.160/27
+77.67.60.32/27
+77.67.60.128/29
+77.67.60.152/29
+77.67.61.232/30
+77.67.107.100/30
+81.171.115.0/27
+81.171.115.32/29
+87.248.192.0/19
+103.10.124.0/23
+103.28.54.0/23
+117.121.248.0/21
+146.66.152.0/23
+146.66.155.0/24
+146.66.156.0/23
+162.254.192.0/21
+185.25.180.0/23
+192.69.96.0/22
+199.229.227.120/29
+203.77.184.0/21
+204.63.214.0/23
+207.159.120.144/28
+207.173.176.0/22
+208.64.200.0/22
+208.78.164.0/22
+208.111.128.0/18
+209.3.157.112/29
+213.202.254.128/28
+213.202.254.192/28
+216.190.227.0/24
+216.207.205.96/28
+"
+
+#FULL bitmap?
+#ipset destroy f2b-recidive
+#ipset create f2b-recidive -exist hash:ip hashsize 32768 maxelem 80000
+
+#ipset create steam4 -exist hash:ip hashsize 32768 maxelem 80000
+#for p in $STEAMIPv4 ; do
+#	ipset -exist add steam4 $p
+##	#ipset -exist add gamecache4 $p
+#done
+
+
+
+
+
+
+
+
+#######################################@@@testcontainer
+ipset -q create cloudflare list:set
+ipset -q add cloudflare cloudflare-v4
+ipset -q add cloudflare cloudflare-v6
+
+
+
+
+
+
+
+ipsets_into_ucidnsmasq #ipsetsintoucidnsmasqdirecttest          #ADDS-IPSETS-to-ETC_CONFIG_DHCPandRESTARTS_DNSMASQIFNEEDED
+
+dynamicipset_setup #topaddconsoledynamicipsetstraf              #ADDS FIREWALL RULES RELATED TO 'GAMING-MAC-LEARNING-IPSETS-ETC'@if?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+UPRATE=$UPLINK
+DOWNRATE=${DOWNLINK}
+#$IPTABLES -t mangle -A POSTROUTING -p tcp -m multiport --ports 443,80 -m dscp --dscp-class CS2 -m connbytes \
+#    --connbytes $((DOWNRATE*26/8)) --connbytes-dir reply --connbytes-mode bytes -j DSCP --set-dscp-class CS0
+#$IP6TABLES -t mangle -A POSTROUTING -p tcp -m multiport --ports 443,80 -m dscp --dscp-class CS2 -m connbytes \
+#    --connbytes $((DOWNRATE*26/8)) --connbytes-dir reply --connbytes-mode bytes -j DSCP --set-dscp-class CS0
+################
+
+#$IPTABLES -t mangle -I POSTROUTING -p tcp -m multiport --ports 443,80 -m dscp --dscp-class CS2 -m connbytes \
+#    --connbytes $((DOWNRATE*26/8)) --connbytes-dir reply --connbytes-mode bytes -j DSCP --set-dscp-class CS0
+#$IP6TABLES -t mangle -I POSTROUTING -p tcp -m multiport --ports 443,80 -m dscp --dscp-class CS2 -m connbytes \
+#    --connbytes $((DOWNRATE*26/8)) --connbytes-dir reply --connbytes-mode bytes -j DSCP --set-dscp-class CS0
+###############
+#$IPTABLES -t mangle -I POSTROUTING -p tcp -m multiport --ports 443,80 -m dscp --dscp-class CS4 -m connbytes \
+#    --connbytes $((DOWNRATE*26/8)) --connbytes-dir reply --connbytes-mode bytes -j DSCP --set-dscp-class CS0
+#$IP6TABLES -t mangle -I POSTROUTING -p tcp -m multiport --ports 443,80 -m dscp --dscp-class CS4 -m connbytes \
+#    --connbytes $((DOWNRATE*26/8)) --connbytes-dir reply --connbytes-mode bytes -j DSCP --set-dscp-class CS0
+###############
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+###QOS_MARK_F_REMAP_${IFACE}
+###QOS_MARK_F_REMAP_${IFACE} ORIGINAL
+###QOS_MARK_F_REMAP_${IFACE}
+################## if it's DSCP LE and from my backup box then re-map to BK.
+#ipt  -t mangle -A QOS_MARK_F_REMAP_${IFACE} -m dscp --dscp 0x01 -p tcp -s waldorf -j DSCP --set-dscp-class CS1
+################## save it
+#ipt -t mangle -A QOS_MARK_F_REMAP_${IFACE} -j CONNMARK --set-dscpmark 0xfc000000/0x03000000
+################# and out - that was easy!
+###########JUMPTOHOOK QOS_MARK_F_${IFACE} starts here
+# if dscp!= 0 then goto QOS_MARK_F_REMAP_${IFACE} ie. special case packets that already have a DSCP
+#ipt  -t mangle -A QOS_MARK_F_${IFACE} -m dscp ! --dscp 0x00 -g QOS_MARK_F_REMAP_${IFACE}
+
+
+
+
+
+
+
+
+
+
+
+
+
+#@@@CS2+conbytesover?ipt  -t mangle -A QOS_MARK_F_REMAP_${IFACE} -m dscp --dscp 0x01 -p tcp -s waldorf -j DSCP --set-dscp-class CS1
+
+
+########################################################################### TESTINGTHIS 18=streaming
+#ipt  -t mangle -A QOS_MARK_F_REMAP_${IFACE} -m dscp --dscp 0x18 -j RETURN
+############# 0x08 = downgrade to CS1
+#ipt  -t mangle -A QOS_MARK_F_REMAP_${IFACE} -m dscp --dscp 0x08 -j RETURN
+
+
+
+
+ipt -t mangle -A QOS_MARK_F_REMAP_${IFACE} -j CONNMARK --set-dscpmark 0xfc000000/0x03000000
+# and out - that was easy!
+
+
+
+
+
+
+
+
+
+# QOS_MARK_F_${IFACE} starts here NOTE: 'g'
+# if dscp!= 0 then goto QOS_MARK_F_REMAP_${IFACE} ie. special case packets that already have a DSCP
+#ipt  -t mangle -A QOS_MARK_F_${IFACE} -m dscp ! --dscp 0x00 -g QOS_MARK_F_REMAP_${IFACE}
+ipt  -t mangle -A QOS_MARK_F_${IFACE} -m dscp ! --dscp 0x00 -g QOS_MARK_F_REMAP_${IFACE}
+# else fall through
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#CANWECATCH-NOMARKHERE?+@connbytes if'g'abovereturns(dontthinkso)
+#$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -m dscp --dscp 0x00 -j DSCP --set-dscp-class CS1 -m comment --comment "Bulk CS1 ipset"
+#$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -m dscp --dscp 0x00 -j DSCP --set-dscp-class CS1 -m comment --comment "Bulk CS1 ipset"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+###################################### dlakelantest LOWER>dependingonbelow-I
+#DSCPstaticCHAIN="dscptagstatic"
+setuptagstatic
+IPTBOTH -t mangle -A QOS_MARK_F_${IFACE} -m dscp --dscp 0x00 -j dscptagstatic
+###########################################################################################
+###$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -m dscp --dscp 0x00 -j dscptagstatic
+###$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -m dscp --dscp 0x00 -j dscptagstatic
+###########################################################################################
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+############################################################### ipv4 host bitorrent sample rules
+# Bittorrent box - has to be done explicitly because we're looking at specific ports not just whole host
+###$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -p tcp -s waldorf -m tcp -m multiport --sports 6981,4433 -m comment --comment "BT DSCP LE" -j DSCP --set-dscp 1
+###$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -p udp -s waldorf -m udp --sport 6981 -m comment --comment "BT DSCP LE" -j DSCP --set-dscp 1
+############# the destination versions don't appear to be required, so commented out.
+#####$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -p tcp -d waldorf -m tcp -m multiport --dports 6981,4433 -m comment --comment "BT DSCP CS1 Bulk" -j DSCP --set-dscp-class CS1
+#####$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -p udp -d waldorf -m udp --dport 6981 -m comment --comment "BT DSCP CS1 Bulk" -j DSCP --set-dscp-class CS1
+
+
+
+###JUSTTESTABOVEONWHOLENETWORK###################
+IPTBOTH -t mangle -A QOS_MARK_F_${IFACE} -p tcp -m tcp -m multiport --sports 6981,4433 -m comment --comment "TORRENT DSCP LE" -j DSCP --set-dscp 1
+IPTBOTH -t mangle -A QOS_MARK_F_${IFACE} -p udp -m udp --sport 6981 -m comment --comment "TORRENT DSCP LE" -j DSCP --set-dscp 1
+############# the destination versions don't appear to be required, so commented out
+#####$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -p tcp -d waldorf -m tcp -m multiport  --dports 6981,4433 / -m udp --dport 6981
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+##########ORIGINAL-IPSETMATCHES>BOTH
+############## If you want a connection to remain as CS0 Best Effort, you force the DSCP Fixed bit, the 'set' bit will be set later
+#$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set Bulk4  dst -j DSCP --set-dscp-class CS1 -m comment --comment "Bulk CS1 ipset"
+#$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set Bulk4  src -j DSCP --set-dscp-class CS1 -m comment --comment "Bulk CS1 ipset"
+##############
+#$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set BE4 dst -j CONNMARK --set-xmark 0x01000000/0x01000000 -m comment --comment "Best Effort CS0 ipset"
+#$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set BE4 src -j CONNMARK --set-xmark 0x01000000/0x01000000 -m comment --comment "Best Effort CS0 ipset"
+############# VID 4ct@CS3>CS1
+#$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set Vid4   dst -j DSCP --set-dscp-class CS3 -m comment --comment "Vid CS3 ipset"
+#$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set Vid4   src -j DSCP --set-dscp-class CS3 -m comment --comment "Vid CS3 ipset"
+############ VOICE
+#$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set Voice4 dst -j DSCP --set-dscp-class CS4 -m comment --comment "Voice CS4 ipset"
+#$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set Voice4 src -j DSCP --set-dscp-class CS4 -m comment --comment "Voice CS4 ipset"
+
+##########ORIGINAL-IPSETMATCHES>NOWBOTH
+##########ORIGINAL-IPSETMATCHES>NOWBOTH WAS NO IPTABLES6here LOWER?
+##########ORIGINAL-IPSETMATCHES>NOWBOTH
+############## If you want a connection to remain as CS0 Best Effort, you force the DSCP Fixed bit, the 'set' bit will be set later
+IPTBOTH -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set Bulk4  dst -j DSCP --set-dscp-class CS1 -m comment --comment "Bulk CS1 ipset"
+IPTBOTH -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set Bulk4  src -j DSCP --set-dscp-class CS1 -m comment --comment "Bulk CS1 ipset"
+##############
+IPTBOTH -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set BE4 dst -j CONNMARK --set-xmark 0x01000000/0x01000000 -m comment --comment "Best Effort CS0 ipset"
+IPTBOTH -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set BE4 src -j CONNMARK --set-xmark 0x01000000/0x01000000 -m comment --comment "Best Effort CS0 ipset"
+############# VID 4ct@CS3>CS1
+IPTBOTH -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set Vid4   dst -j DSCP --set-dscp-class CS3 -m comment --comment "Vid CS3 ipset"
+IPTBOTH -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set Vid4   src -j DSCP --set-dscp-class CS3 -m comment --comment "Vid CS3 ipset"
+############ VOICE
+IPTBOTH -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set Voice4 dst -j DSCP --set-dscp-class CS4 -m comment --comment "Voice CS4 ipset"
+IPTBOTH -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set Voice4 src -j DSCP --set-dscp-class CS4 -m comment --comment "Voice CS4 ipset"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#ipt  -t mangle -A QOS_MARK_F_${IFACE} -m dscp ! --dscp 0x00
+
+
+
+
+
+
+
+
+
+
+
+
+
+### GAMING
+### GAMING
+### GAMING
+######### MYIPSET-GAMING #3try -I CS3 #2-A #1CS4
+$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set ${sLBL}4 dst -j DSCP --set-dscp-class CS4 -m comment --comment "GAMING4-CS4"
+$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set ${sLBL}4 src -j DSCP --set-dscp-class CS4 -m comment --comment "GAMING4-CS4"
+$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set ${sLBL}6 dst -j DSCP --set-dscp-class CS4 -m comment --comment "GAMING6-CS4"
+$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set ${sLBL}6 src -j DSCP --set-dscp-class CS4 -m comment --comment "GAMING6-CS4"
+
+
+
+
+
+
+
+
+
+
+
+
+
+### STREAMING
+### STREAMING
+### STREAMING
+####### #1CS3 #2CS1 #LASTCS1 6-BASE RETURNFIRSTBECAUSE-I##############################################################
+#WASON $IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set streaming src,dst -j RETURN
+#WASON $IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set streaming6 src,dst -j RETURN
+#??????IPTBOTH -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set streaming src,dst -j RETURN
+###3
+#WASON-NOWORK $IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set streaming src,dst -j DSCP --set-dscp-class CS1 -m comment --comment "Vid CS3 ipset"
+#WASON-NOWORK $IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set streaming6 src,dst -j DSCP --set-dscp-class CS1 -m comment --comment "Vid CS3 ipset"
+#############
+#CURRENT-SKIPRETURNTEST CANT USE BOTH@@@container-set NOTE -I GOES ABOVE
+#IPTBOTH -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set streaming src -j RETURN
+#IPTBOTH -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set streaming dst -j RETURN
+################################################################################################################
+#4
+$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set streaming   dst -j DSCP --set-dscp-class CS3 -m comment --comment "STREAMING4-CS3"
+$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set streaming   src -j DSCP --set-dscp-class CS3 -m comment --comment "STREAMING4 CS3"
+#6
+$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set streaming6   dst -j DSCP --set-dscp-class CS3 -m comment --comment "STREAMING6-SRC-CS3"
+$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set streaming6   src -j DSCP --set-dscp-class CS3 -m comment --comment "STREAMING6-DST-CS3"
+
+
+
+
+
+
+
+
+
+
+
+### GAMECACHE
+### GAMECACHE
+### GAMECACHE
+### GAMECACHE
+######################1 gamecache mark vid for now
+#$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set gamecache4 src,dst -j RETURN
+#$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set gamecache6  src,dst -j RETURN
+###9
+$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set gamecache4 src -j DSCP --set-dscp-class CS3 -m comment --comment "Vid CS3 ipset"
+$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set gamecache4 dst -j DSCP --set-dscp-class CS3 -m comment --comment "Vid CS3 ipset"
+$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set gamecache6  src -j DSCP --set-dscp-class CS3 -m comment --comment "Vid CS3 ipset"
+$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set gamecache6  dst -j DSCP --set-dscp-class CS3 -m comment --comment "Vid CS3 ipset"
+
+
+
+
+
+
+
+
+### CLOUDFLARE
+### CLOUDFLARE
+### CLOUDFLARE
+###dst,src does not work -I RETURN not needed? 5 ###############################################################
+#$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set cloudflare-v4 src,dst -j RETURN
+#$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set cloudflare-v6 src,dst -j RETURN
+#$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set cloudflare-v4 src,dst -j DSCP --set-dscp-class CS3 -m comment --comment "Vid CS3 ipset"
+#$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set cloudflare-v6 src,dst -j DSCP --set-dscp-class CS3 -m comment --comment "Vid CS3 ipset"
+###6lostRETURN ###############################################################################################
+$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set cloudflare-v4 src -j DSCP --set-dscp-class CS3 -m comment --comment "Vid CS3 ipset"
+$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set cloudflare-v4 dst -j DSCP --set-dscp-class CS3 -m comment --comment "Vid CS3 ipset"
+$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set cloudflare-v6 src -j DSCP --set-dscp-class CS3 -m comment --comment "Vid CS3 ipset"
+$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set cloudflare-v6 dst -j DSCP --set-dscp-class CS3 -m comment --comment "Vid CS3 ipset"
+
+
+
+
+
+###### CDN 1-AF21
+###### CDN 1-AF21
+###### CDN 1-AF21
+###### CDN 1-AF21
+###### CDN 1-AF21
+###### CDN 1-AF21
+$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set usrcdn src -j DSCP --set-dscp-class AF21 -m comment --comment "usrcdn-ipset"
+$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set usrcdn dst -j DSCP --set-dscp-class AF21 -m comment --comment "usrcdn-ipset"
+$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set usrcdn6 src -j DSCP --set-dscp-class AF21 -m comment --comment "usrcdn6-ipset"
+$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set usrcdn6 dst -j DSCP --set-dscp-class AF21 -m comment --comment "usrcdn6-ipset"
+
+
+
+
+
+
+
+
+
+
+
+
+
+########################### 443 #####################3
+########################### 443 #####################3
+########################### 443 #####################3
+########################### 443 #####################3
+########################### 443 #####################3
+########################### 443 #####################3
+########################### 443 #####################3
+########################### 443 #####################3
+##### 1 AF21
+#$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -p tcp -m tcp --dport 443 -j DSCP --set-dscp-class AF21 -m comment --comment "usrcdn-ipset"
+#$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -p tcp -m tcp --sport 443 -j DSCP --set-dscp-class AF21 -m comment --comment "usrcdn-ipset"
+#$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -p tcp -m tcp --dport 443 -j DSCP --set-dscp-class AF21 -m comment --comment "usrcdn-ipset"
+#$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -p tcp -m tcp --sport 443 -j DSCP --set-dscp-class AF21 -m comment --comment "usrcdn-ipset"
+##### 2 no sport dport
+#$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -p tcp -m tcp --dport 443 -j DSCP --set-dscp-class AF21 -m comment --comment "usrcdn-ipset"
+#$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -p tcp -m tcp --sport 443 -j DSCP --set-dscp-class AF21 -m comment --comment "usrcdn-ipset"
+#$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -p tcp -m tcp --dport 443 -j DSCP --set-dscp-class AF21 -m comment --comment "usrcdn-ipset"
+#$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -p tcp -m tcp --sport 443 -j DSCP --set-dscp-class AF21 -m comment --comment "usrcdn-ipset"
+###### 3 CS3 ###### 5 CS5
+#$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -p tcp -m tcp --dport 443 -j DSCP --set-dscp-class CS5 -m comment --comment "usrcdn-ipset"
+#$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -p tcp -m tcp --sport 443 -j DSCP --set-dscp-class CS5 -m comment --comment "usrcdn-ipset"
+#$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -p tcp -m tcp --dport 443 -j DSCP --set-dscp-class CS5 -m comment --comment "usrcdn-ipset"
+#$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -p tcp -m tcp --sport 443 -j DSCP --set-dscp-class CS5 -m comment --comment "usrcdn-ipset"
+########################### 443 #####################3
+########################### 443 #####################3
+########################### 443 #####################3
+########################### 443 #####################3
+########################### 443 #####################3
+
+
+
+
+
+##################CONTROL+USERFACING-MULTI ### WASHERE HANDLED BY OTHER RULES EXCEPT 143,161,162,514,8080
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Dynamic rules - These get run when a connection first goes above our bulk transfer size limit.
+# # if stored DSCP is CS0 (Best effort) then set it to CS1 (bulk) - this is the dynamic de-prioritisation.
+# echL "markbulk@ipsets" msg
+############## If you want a connection to remain as CS0 Best Effort, you force the DSCP Fixed bit, the 'set' bit will be set later
+
+
+
+
+
+
+
+
+
+###################### bulk
+###################### bulk
+###################### bulk
+###################### bulk
+###################### bulk
+###################### bulk
+#$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -p tcp -m set --match-set bulk src,dst -j DSCP --set-dscp-class CS1 -m comment --comment "bulk traffic ipset"
+#$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -p udp -m set --match-set bulk src,dst -j DSCP --set-dscp-class CS1 -m comment --comment "bulk traffic ipset"
+#$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -p tcp -m set --match-set bulk6 src,dst -j DSCP --set-dscp-class CS1 -m comment --comment "bulk traffic ipset"
+#$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -p udp -m set --match-set bulk6 src,dst -j DSCP --set-dscp-class CS1 -m comment --comment "bulk traffic ipset"
+#$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -p tcp -m connbytes --connbytes 350000: --connbytes-dir both --connbytes-mode bytes -m dscp --dscp-class CS0 -j DSCP --set-dscp-class CS1 -m comment --comment "Downgrade CS0 to CS1 for bulk tcp traffic"
+#$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -p tcp -m connbytes --connbytes 350000: --connbytes-dir both --connbytes-mode bytes -m dscp --dscp-class CS0 -j DSCP --set-dscp-class CS1 -m comment --comment "Downgrade CS0 to CS1 for bulk tcp traffic"
+###try -I
+
+
+
+
+### 6.5 ##### iptbothmark
+#IPTBOTH -t mangle -I QOS_MARK_F_${IFACE} -p tcp -m set --match-set bulk src,dst -j DSCP --set-dscp-class CS1 -m comment --comment "bulk traffic ipset"
+#IPTBOTH -t mangle -I QOS_MARK_F_${IFACE} -p udp -m set --match-set bulk src,dst -j DSCP --set-dscp-class CS1 -m comment --comment "bulk traffic ipset"
+###7 src sep dst plus tcp udp
+#4
+$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -p tcp -m set --match-set bulk src -j DSCP --set-dscp-class CS1 -m comment --comment "BULK4-TCPSRC-CS1"
+$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -p udp -m set --match-set bulk src -j DSCP --set-dscp-class CS1 -m comment --comment "BULK4-UDPSRC-CS1"
+$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -p tcp -m set --match-set bulk dst -j DSCP --set-dscp-class CS1 -m comment --comment "BULK4-TCPDST-CS1"
+$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -p udp -m set --match-set bulk dst -j DSCP --set-dscp-class CS1 -m comment --comment "BULK4-UDPDST-CS1"
+
+#TESTTHESEHERETOO
+#???
+$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set bulk dst -j CONNMARK --set-xmark 0x01000000/0x01000000 -m comment --comment "Best Effort CS0 ipset"
+#???
+$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set bulk src -j CONNMARK --set-xmark 0x01000000/0x01000000 -m comment --comment "Best Effort CS0 ipset"
+
+
+
+
+#6
+$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -p tcp -m set --match-set bulk6 src -j DSCP --set-dscp-class CS1 -m comment --comment "BULK6-TCPSRC-CS1"
+$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -p udp -m set --match-set bulk6 src -j DSCP --set-dscp-class CS1 -m comment --comment "BULK6-UDPSRC-CS1"
+$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -p tcp -m set --match-set bulk6 dst -j DSCP --set-dscp-class CS1 -m comment --comment "BULK6-TCPDST-CS1"
+$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -p udp -m set --match-set bulk6 dst -j DSCP --set-dscp-class CS1 -m comment --comment "BULK6-UDPDST-CS1"
+
+
+#TESTTHISOUT
+$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set bulk6 dst -j CONNMARK --set-xmark 0x01000000/0x01000000 -m comment --comment "Best Effort CS0 ipset"
+$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set bulk6 src -j CONNMARK --set-xmark 0x01000000/0x01000000 -m comment --comment "6-WASBE4-TESTON-bulk6"
+
+###################### bulk
+###################### bulk
+###################### bulk
+###################### bulk
+###################### bulk
+###################### bulk
+###################### bulk
+###################### bulk
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+####HISHAMDOWNGRADE
+####HISHAMDOWNGRADE
+####HISHAMDOWNGRADE
+#IPTBOTH -t mangle -A QOS_MARK_F_${IFACE} -p tcp -m connbytes --connbytes 350000: --connbytes-dir both --connbytes-mode bytes -m dscp --dscp-class CS0 -j DSCP --set-dscp-class CS1 -m comment --comment "Downgrade CS0 to CS1 for bulk tcp traffic"
+#IPTBOTH -t mangle -A QOS_MARK_F_${IFACE} -p tcp -m connbytes --connbytes 350000: --connbytes-dir both --connbytes-mode bytes -m dscp --dscp-class CS0 -j RETURN
+####HISHAMDOWNGRADE
+####HISHAMDOWNGRADE
+####HISHAMDOWNGRADE
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+############### 3.1 CS4sepSRCDST
+###COMBINEDSRCDST 3.2
+#$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set latsens src,dst -j DSCP --set-dscp-class CS4 -m comment --comment "Voice CS4 ipset"
+#$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set latsens6 src,dst -j DSCP --set-dscp-class CS4 -m comment --comment "Voice CS4 ipset"
+################TESTJOINEDsetCONTAINERforMATCHandIPTBOTH #####3ipset -q add latsensitive latsens
+#???IPTBOTH -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set latsensitive src,dst -j DSCP --set-dscp-class CS4 -m comment --comment "Voice CS4 ipset"
+### 3 seperatesrcdstagain NOTE -I > ontop!
+$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set latsens src -j DSCP --set-dscp-class CS4 -m comment --comment "Voice CS4 ipset"
+$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set latsens dst -j DSCP --set-dscp-class CS4 -m comment --comment "Voice CS4 ipset"
+$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set latsens6 src -j DSCP --set-dscp-class CS4 -m comment --comment "Voice CS4 ipset"
+$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -m set --match-set latsens6 dst -j DSCP --set-dscp-class CS4 -m comment --comment "Voice CS4 ipset"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+################################################################## ipv6
+#$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -p tcp -s waldorf -m tcp -m multiport --sports 6981,4433,4434 -m comment --comment "BT DSCP LE" -j DSCP --set-dscp 1
+#$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -p udp -s waldorf -m udp --sport 6981 -m comment --comment "BT DSCP LE" -j DSCP --set-dscp 1
+############## the destination versions don't appear to be required, so commented out.
+#########$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -p tcp -d waldorf -m tcp -m multiport --dports 6981,4433,4434 -m comment --comment "BT DSCP CS1 Bulk" -j DSCP --set-dscp-class CS1
+########$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -p udp -d waldorf -m udp --dport 6981 -m comment --comment "BT DSCP CS1 Bulk" -j DSCP --set-dscp-class CS1
+#########################################################################
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+###ORIGINAL-LDIR-RULE@Bulk6
+$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set Bulk6  dst -j DSCP --set-dscp-class CS1 -m comment --comment "Bulk CS1 ipset"
+$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set Bulk6  src -j DSCP --set-dscp-class CS1 -m comment --comment "Bulk CS1 ipset"
+
+
+
+######## If you want a connection to remain as CS0 Best Effort, you force the DSCP Fixed bit, the 'set' bit will be set later
+$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set BE6 dst -j CONNMARK --set-xmark 0x01000000/0x01000000 -m comment --comment "Best Effort CS0 ipset"
+$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set BE6 src -j CONNMARK --set-xmark 0x01000000/0x01000000 -m comment --comment "Best Effort CS0 ipset"
+
+
+
+
+
+
+
+
+
+
+###ORIGINAL-LDIR-RULE@Vid6 Voice6 why-solow-one-after-eachV4-V6-CS0 line
+$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set Vid6   dst -j DSCP --set-dscp-class CS3 -m comment --comment "Vid CS3 ipset"
+$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set Vid6   src -j DSCP --set-dscp-class CS3 -m comment --comment "Vid CS3 ipset"
+
+
+$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set Voice6 dst -j DSCP --set-dscp-class CS4 -m comment --comment "Voice CS4 ipset"
+$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -m set --match-set Voice6 src -j DSCP --set-dscp-class CS4 -m comment --comment "Voice CS4 ipset"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+###############################unificontroller ########### -> CS0 BE?
+###$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -p tcp -s unificontroller -m tcp -m multiport --dports 8883 -m comment --comment "UnifiController CS0 BE" -j CONNMARK --set-xmark 0x01000000/0x01000000
+
+
+
+
+
+####################################################### Apple
+$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -p tcp -d 17.0.0.0/8 -m tcp -m multiport --dports 5223,993 -m comment --comment "APNS,mail CS0 BE" -j CONNMARK --set-xmark 0x01000000/0x01000000
+
+
+
+
+
+
+
+
+
+###NEWFAILS $IPTABLES -t mangle -D QOS_MARK_F_${IFACE} -p tcp -d 17.0.0.0/8 -m tcp -m multiport --dports 5223,993 -m comment --comment "APNS,mail CS0 BE" -j CONNMARK --set-xmark 0x01000000/0x01000000 2>/dev/null
+#echL "DEBUG IPTABLES $IPTABLES" #DEBUG IPTABLES iptables_wrapper
+#echL "DEBUG IP6TABLES $IP6TABLES" #DEBUG IP6TABLES ip6tables_wrapper
+###Tue Jan 19 22:02:22 2021 user.notice SQM: ERROR: cmd_wrapper: iptables: FAILURE (1): /usr/sbin/iptables -t mangle -D QOS_MARK_F_eth1 -p tcp -d 17.0.0.0/8 -m tcp -m multiport --dports 5223,993 -m comment --comment APNS,mail CS0 BE -j CONNMARK --set-xmark 0x01000000/0x01000000
+
+
+
+
+
+#Facetime is interesting. Apple say that for firewall purposes only certain ports are used, they don't say if that's source
+#or destination. Turns out it's both, so look for connections with both a source & destination port in the Facetime range
+ipt -t mangle -A QOS_MARK_F_${IFACE} -p udp -m udp -m multiport --sports 3478:3497,16384:16387,16393:16402 -m multiport --dports 3478:3497,16384:16387,16393:16402,16609:16618 -m comment --comment "Facetime CS3 Vid" -j DSCP --set-dscp-class CS3
+
+
+###############################Zoom - connections go to Zoom with dest ports 8801-8810
+$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -p udp -m udp -m set --match-set Zoom4 dst -m multiport --dports 8801:8810 -j DSCP --set-dscp-class CS3 -m comment --comment "Zoom CS3 VI"
+$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -p udp -m udp -m set --match-set Zoom6 dst -m multiport --dports 8801:8810 -j DSCP --set-dscp-class CS3 -m comment --comment "Zoom CS3 VI"
+####################################Whatsapp Video
+ipt -t mangle -A QOS_MARK_F_${IFACE} -p udp -m udp -m multiport --dports 3478 -m comment --comment "Whatsapp CS3 VI" -j DSCP --set-dscp-class CS3
+
+
+
+
+
+
+#####################Irc
+ipt -t mangle -A QOS_MARK_F_${IFACE} -p tcp -m tcp -m multiport --dports 6697 -m comment --comment "IRC CS0 BE" -j CONNMARK --set-xmark 0x01000000/0x01000000
+####################Wireguard
+ipt -t mangle -A QOS_MARK_F_${IFACE} -p udp -m udp -m multiport --sports 51820 -m comment --comment "WG CS0 BE" -j CONNMARK --set-xmark 0x01000000/0x01000000
+
+
+
+
+
+
+
+
+
+#####################
+#    CONTROL ICMP
+#####################Icmp/v6 OVERRULEDELSEWHEREorisCONNMARKofUSE? 1.0
+$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -p icmp -m comment --comment "Ping CS0 BE" -j CONNMARK --set-xmark 0x01000000/0x01000000
+$IP6TABLES -t mangle -A QOS_MARK_F_${IFACE} -p icmpv6 -m comment --comment "Ping CS0 BE" -j CONNMARK --set-xmark 0x01000000/0x01000000
+
+
+
+
+
+
+#####################Icmp/v6 OVERRULEDELSEWHEREorisCONNMARKofUSE? 1.1
+#1-CS5#2EF#3AF31#3.1EF
+#$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -p icmp -j DSCP --set-dscp-class EF -m comment --comment "ICMP-EF"
+#$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -p icmpv6 -j DSCP --set-dscp-class EF -m comment --comment "ICMP6-EF"
+#####################
+#    CONTROL UDP
+####### CONTROL-TRAFFIX-ONELINE(for@tagstatix-for) #1!tcp@6CS5-#2EF #3!tcp@6AF31 #5-EFudpudp
+#$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -p udp -m multiport --ports 53,5353,123 -j DSCP --set-dscp-class EF -m comment --comment "DNS-NTP-UDP-EF"
+#$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -p udp -m multiport --ports 53,5353,123 -j DSCP --set-dscp-class EF -m comment --comment "DNS6-NTP6-UDP-EF"
+#NOTEF
+
+
+
+
+#PROPERCMDS
+#$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -p udp -m multiport \
+#    --ports 53,5353,123 -j DSCP \
+#    --set-dscp-class CS5 -m comment --comment "DNS-NTP4-UDP-CS5"
+#$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -p udp -m multiport \
+#    --ports 53,5353,123 -j DSCP \
+#    --set-dscp-class CS5 -m comment --comment "DNS6-NTP6-UDP-CS5"
+
+
+
+#TESTAF42->0x24
+#$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -p udp -m multiport \
+#    --ports 53,5353,123 -j DSCP \
+#    --set-dscp-class AF42 -m comment --comment "DNS-NTP4-UDP-CS5"
+#$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -p udp -m multiport \
+#    --ports 53,5353,123 -j DSCP \
+#    --set-dscp-class AF42 -m comment --comment "DNS6-NTP6-UDP-CS5"
+
+
+#MultMedStreaming-AF33DNS-NTP4-UDP-CS5 -j DSCP --set-dscp 0x1e
+#$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -p udp -m multiport \
+#    --ports 53,5353,123 -j DSCP \
+#    --set-dscp-class AF33 -m comment --comment "DNS-NTP4-UDP-CS5"
+#$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -p udp -m multiport \
+#    --ports 53,5353,123 -j DSCP \
+#    --set-dscp-class AF33 -m comment --comment "DNS6-NTP6-UDP-CS5"
+
+#BE 0x0
+#$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -p udp -m multiport \
+#    --ports 53,5353,123 -j DSCP \
+#    --set-dscp-class BE -m comment --comment "DNS-NTP4-UDP-CS5"
+#$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -p udp -m multiport \
+#    --ports 53,5353,123 -j DSCP \
+#    --set-dscp-class BE -m comment --comment "DNS6-NTP6-UDP-CS5"
+
+
+
+
+##############################################################
+#AF11-tin1(2) 0x0a HIGHTGHROUGHPUT/bulk
+#$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -p udp -m multiport \
+#    --ports 53,5353,123 -j DSCP \
+#    --set-dscp-class AF11 -m comment --comment "DNS-NTP4-UDP-CS5"
+#$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -p udp -m multiport \
+#    --ports 53,5353,123 -j DSCP \
+#    --set-dscp-class AF11 -m comment --comment "DNS6-NTP6-UDP-CS5"
+#################################################################
+
+#EF 0x2e tin-6?
+$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -p udp -m multiport \
+    --ports 53,5353,123,67,68 -j DSCP \
+    --set-dscp-class EF -m comment --comment "DNS-NTP4-UDP-CS5"
+$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -p udp -m multiport \
+    --ports 53,5353,123,546,547 -j DSCP \
+    --set-dscp-class EF -m comment --comment "DNS6-NTP6-UDP-CS5"
+
+
+
+#CS6?
+#$IPTABLES -t mangle -I QOS_MARK_F_${IFACE} -p udp -m multiport \
+#    --ports 53,5353,123 -j DSCP \
+#    --set-dscp-class AF21 -m comment --comment "DNS-NTP4-UDP-CS5"
+#$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -p udp -m multiport \
+#    --ports 53,5353,123 -j DSCP \
+#    --set-dscp-class AF21 -m comment --comment "DNS6-NTP6-UDP-CS5"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+######################
+######################
+######################
+#    STORE MARKS
+######################
+######################
+####################### store the decided DSCP into connmark for later restoration by ctinfo
+ipt -t mangle -A QOS_MARK_F_${IFACE} -j CONNMARK --set-dscpmark 0xfc000000/0x02000000
+####################### if we stored a non best effort DSCP then lock it in place, there's no traffic based deprioritisation required
+ipt -t mangle -A QOS_MARK_F_${IFACE} -m connmark ! --mark 0x0/0xfc000000 -j CONNMARK --set-xmark 0x01000000/0x01000000
+# ---- End of 'hard/fixed' rules
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#######################
+#######################
+#######################
+#   Dynamic rules
+######################
+#######################
+#######################
+#   These get run when a connection first goes above our bulk transfer size limit
+#   if-stored-DSCP=CS0=(Best effort) > set-to-CS1=(bulk) -> this is the dynamic de-prioritisation
+##############################################################################################################
+# CS1 = 8 << 2 = 0x20, setting our Fixed bit = 0x21
+# ipt -t mangle -A QOS_MARK_D_${IFACE} -m connmark --mark 0x00000000/0xfc000000 -j CONNMARK --set-xmark 0x20000000/0x20000000
+# and by now whatever we have we stick with, so set DSCPFixed bit
+ipt -t mangle -A QOS_MARK_D_${IFACE} -j CONNMARK --set-xmark 0x21000000/0x21000000
+######################## ---- End of Dynamic Rules
+######################## ---- End of Dynamic Rules
+######################## ---- End of Dynamic Rules
+
+
+
+
+
+
+
+
+
+
+
+
+
+################# # It all starts here
+################# # It all starts here
+################# # It all starts here
+# CAKE chain to combine hard/dynamic rules
+#########################################
+################# # It all starts here
+################# Send unmarked connections to the hard/fixed marking chain
+ipt -t mangle -A QOS_CAKE_${IFACE} -m connmark --mark 0x00000000/0x02000000 -g QOS_MARK_F_${IFACE}
+
+
+
+
+
+
+
+
+
+######################
+######################
+# Send marked connections over CONNB bytes and not DSCPFixed to the dynamic rules
+######################## # original direction first - the original src ip is local # ipv4
+if [ "$SUBNET" ] ; then
+	$IPTABLES -t mangle -A QOS_CAKE_${IFACE} -m conntrack --ctorigsrc ${SUBNET} -g QOS_MARK_D_orig_${IFACE}
+	$IPTABLES -t mangle -A QOS_CAKE_${IFACE} -m conntrack --ctreplsrc ${SUBNET} -g QOS_MARK_D_repl_${IFACE}
+
+	# orig direction
+	$IPTABLES -t mangle -A QOS_MARK_D_orig_${IFACE} \
+	-m connbytes --connbytes ${CONNBUP} --connbytes-dir original --connbytes-mode bytes \
+	-g QOS_MARK_D_${IFACE}
+	$IPTABLES -t mangle -A QOS_MARK_D_orig_${IFACE} \
+	-m connbytes --connbytes ${CONNBDN} --connbytes-dir reply  --connbytes-mode bytes \
+	-g QOS_MARK_D_${IFACE}
+
+
+
+	# reply direction - reply src IP is local
+	$IPTABLES -t mangle -A QOS_MARK_D_repl_${IFACE} \
+	-m connbytes --connbytes ${CONNBDN} --connbytes-dir original --connbytes-mode bytes \
+	-g QOS_MARK_D_${IFACE}
+	$IPTABLES -t mangle -A QOS_MARK_D_repl_${IFACE} \
+	-m connbytes --connbytes ${CONNBUP} --connbytes-dir reply --connbytes-mode bytes \
+	-g QOS_MARK_D_${IFACE}
+
+
+
+
+
+	#$IPTABLES -t mangle -I QOS_MARK_D_${IFACE} -p tcp -m tcp --dport 443 -j DSCP \
+    #    --set-dscp-class AF11 -m comment --comment "DNS6-NTP6-UDP-CS5"
+
+	#$IPTABLES -t mangle -A QOS_MARK_D_repl_${IFACE} \
+    #    -p tcp -m tcp --sport 443  \
+    #    -m connbytes --connbytes $((${CONNBDN} / 2000)) --connbytes-dir reply --connbytes-mode bytes \
+    #-j DSCP --set-dscp-class AF11 -m comment --comment "DNS6-NTP6-UDP-CS5"
+	
+    #$IPTABLES -t mangle -A QOS_MARK_D_repl_${IFACE} \
+    #    -p tcp -m tcp --sport 443  \
+    #    -m connbytes --connbytes $((${CONNBDN} / 2000)) --connbytes-dir original --connbytes-mode bytes \
+    #-j DSCP --set-dscp-class AF11 -m comment --comment "DNS6-NTP6-UDP-CS5"
+    
+    
+    #$IPTABLES -t mangle -I QOS_MARK_D_repl_${IFACE} \
+    #    -p tcp -m tcp --sport 443  \
+    #    -m connbytes --connbytes $((${CONNBDN} / 2000)) --connbytes-dir reply --connbytes-mode bytes \
+    #-j DSCP --set-dscp-class AF11 -m comment --comment "DNS6-NTP6-UDP-CS5"
+
+fi
+
+
+
+
+
+
+
+
+
+
+
+
+
+############################################ and now for ipv6.
+if [ "$PREFIX" ] ; then
+	$IP6TABLES -t mangle -A QOS_CAKE_${IFACE} -m conntrack --ctorigsrc ${PREFIX} -g QOS_MARK_D_orig_${IFACE}
+	$IP6TABLES -t mangle -A QOS_CAKE_${IFACE} -m conntrack --ctreplsrc ${PREFIX} -g QOS_MARK_D_repl_${IFACE}
+
+	# orig direction
+	$IP6TABLES -t mangle -A QOS_MARK_D_orig_${IFACE} \
+	-m connbytes --connbytes ${CONNBUP} --connbytes-dir original --connbytes-mode bytes \
+	-g QOS_MARK_D_${IFACE}
+	$IP6TABLES -t mangle -A QOS_MARK_D_orig_${IFACE} \
+	-m connbytes --connbytes ${CONNBDN} --connbytes-dir reply --connbytes-mode bytes \
+	-g QOS_MARK_D_${IFACE}
+
+	# reply direction
+	$IP6TABLES -t mangle -A QOS_MARK_D_repl_${IFACE} \
+	-m connbytes --connbytes ${CONNBDN} --connbytes-dir original --connbytes-mode bytes \
+	-g QOS_MARK_D_${IFACE}
+	
+    $IP6TABLES -t mangle -A QOS_MARK_D_repl_${IFACE} \
+	-m connbytes --connbytes ${CONNBUP} --connbytes-dir reply --connbytes-mode bytes \
+	-g QOS_MARK_D_${IFACE}
+	
+
+
+
+    #$IP6TABLES -t mangle -I QOS_MARK_D_${IFACE} -p tcp -m tcp --dport 443 -j DSCP \
+    #    --set-dscp-class AF11 -m comment --comment "DNS6-NTP6-UDP-CS5"
+
+	#$IP6TABLES -t mangle -A QOS_MARK_D_repl_${IFACE} \
+    #    -p tcp -m tcp --sport 443  \
+    #    -m connbytes --connbytes $((${CONNBDN} / 2000)) --connbytes-dir reply --connbytes-mode bytes \
+    #-j DSCP --set-dscp-class AF11 -m comment --comment "DNS6-NTP6-UDP-CS5"
+
+	#$IP6TABLES -t mangle -A QOS_MARK_D_repl_${IFACE} \
+    #    -p tcp -m tcp --sport 443  \
+    #    -m connbytes --connbytes $((${CONNBDN} / 2000)) --connbytes-dir original --connbytes-mode bytes \
+    #-j DSCP --set-dscp-class AF11 -m comment --comment "DNS6-NTP6-UDP-CS5"
+	
+    #$IP6TABLES -t mangle -I QOS_MARK_D_repl_${IFACE} \
+    #    -p tcp -m tcp --sport 443  \
+    #    -m connbytes --connbytes $((${CONNBDN} / 2000)) --connbytes-dir reply --connbytes-mode bytes \
+    #-j DSCP --set-dscp-class AF11 -m comment --comment "DNS6-NTP6-UDP-CS5"
+
+
+
+fi
+#################################### END CONNMARKHANDLING
+#################################### END CONNMARKHANDLING
+#################################### END CONNMARKHANDLING
+
+
+
+
+
+
+
+
+
+#!!!@largedownloads
+#-A dscptagstatic -p tcp -m tcp --dport 443 -m dscp --dscp 0x00 -m connbytes --connbytes 0:34010625 --connbytes-mode bytes --connbytes-dir reply -j DSCP --set-dscp 0x20
+
+
+
+
+
+
+
+########################################################### Hook the above rules into the firewall path
+ipt -t mangle -A POSTROUTING -o ${IFACE} -m connmark --mark 0x00000000/0x01000000 -j QOS_CAKE_${IFACE}
+#@@@ INPUT/OUTPUT@localCONTROL-HERE
+
+
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ipt_destruct() {
+
+
+    ipt -t mangle -D POSTROUTING -o ${IFACE} -m connmark --mark 0x00000000/0x01000000 -j QOS_CAKE_${IFACE}
+	ipt -t mangle -F QOS_MARK_F_${IFACE}
+	ipt -t mangle -F QOS_MARK_F_REMAP_${IFACE}
+	ipt -t mangle -F QOS_MARK_D_orig_${IFACE}
+	ipt -t mangle -F QOS_MARK_D_repl_${IFACE}
+	ipt -t mangle -F QOS_MARK_D_${IFACE}
+	ipt -t mangle -F QOS_CAKE_${IFACE}
+
+	ipt -t mangle -X QOS_MARK_F_${IFACE}
+	ipt -t mangle -X QOS_MARK_F_REMAP_${IFACE}
+	ipt -t mangle -X QOS_MARK_D_orig_${IFACE}
+	ipt -t mangle -X QOS_MARK_D_repl_${IFACE}
+	ipt -t mangle -X QOS_MARK_D_${IFACE}
+	ipt -t mangle -X QOS_CAKE_${IFACE}
+
+
+
+    #TESTINGTHIS-tagstatixdoubleentries
+    iptables -t mangle -F ${DSCPstaticCHAIN} 2>/dev/null
+    #iptables -t mangle -X ${DSCPstaticCHAIN} 2>/dev/null
+    ip6tables -t mangle -F ${DSCPstaticCHAIN} 2>/dev/null
+    #ip6tables -t mangle -X ${DSCPstaticCHAIN} 2>/dev/null
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+############################################################### dlakelan
+############################################################### dlakelan
+############################################################### dlakelan
+
+
+ipt64dscp(){
+    #iptables -t mangle -A ${DSCPstaticCHAIN} $*
+    #ip6tables -t mangle -A ${DSCPstaticCHAIN} $*
+    $IPTABLES -t mangle -A ${DSCPstaticCHAIN} $*
+    $IP6TABLES -t mangle -A ${DSCPstaticCHAIN} $*
+}
+ipt4dscp() {
+    #iptables -t mangle -A ${DSCPstaticCHAIN} $*
+    $IPTABLES -t mangle -A ${DSCPstaticCHAIN} $*
+}
+ipt6dscp() {
+    #ip6tables -t mangle -A ${DSCPstaticCHAIN} $*
+    $IP6TABLES -t mangle -A ${DSCPstaticCHAIN} $*
+}
+
+
+
+
+setuptagstatic() { #NOTE @ FUNCTIONSABOVE destruct and loadthisfunc not really needed
+
+
+DSCPstaticCHAIN="dscptagstatic"
+
+iptables -t mangle -N ${DSCPstaticCHAIN} 2>/dev/null
+iptables -t mangle -F ${DSCPstaticCHAIN} 2>/dev/null
+ip6tables -t mangle -N ${DSCPstaticCHAIN} 2>/dev/null
+ip6tables -t mangle -F ${DSCPstaticCHAIN} 2>/dev/null
+
+#echo "DLAKELAN-SETx"; set -x
+
+
+#UDP 123 NTP
+####################################################### added NOTE rules are bidirectional-ish
+UDPCONTROLPT="53,5353,123,67,68"
+#TCPCONTROLPT="53,5353,22,1023:1024" #1023:1024fakesample #INVALID 123:123 TCPCONTROLPT="53,5353,22,123:123" #123fakesample
+TCPCONTROLPT="53,5353,22"
+#######################################################
+
+
+
+#echL "DURUP:$DURUP DURDN:$DURDN CONNBDN:$CONNBDN CONNBUP:$CONNBUP"    
+#echL "DOWNLINK:$DOWNLINK UPLINK:$UPLINK"
+##############################################################################
+#UPRATE=18000 #change this to your kbps upload speed
+#DOWNRATE=65000 #change this to about 80% of your download speed (in kbps)
+##############################################################################
+#UPRATE=$(( ${DOWNLINK} * 125 * ${DURDN} ))
+#DOWNRATE=$(( ${UPLINK}   * 125 * ${DURUP} ))
+#SQM::: ctinfo_4layercake_rpi4.qos> DOWNRATE:63675000 UPRATE:185512500
+
+
+
+#UPRATE=$UPLINK
+#DOWNRATE=$(( ${DOWNLINK} / 100 * 80 ))
+#echL "DOWNRATE:$DOWNRATE UPRATE:$UPRATE" SQM::: ctinfo_4layercake_rpi4.qos> DOWNRATE:39520 UPRATE:16980
+#-A dscptagstatic -p tcp -m connbytes --connbytes 0:2470000 --connbytes-mode bytes --connbytes-dir reply -j DSCP --set-dscp 0x10
+#-A dscptagstatic -p tcp -m connbytes --connbytes 49400000 --connbytes-mode bytes --connbytes-dir reply -j DSCP --set-dscp 0x08
+
+
+
+UPRATE=$UPLINK
+DOWNRATE=${DOWNLINK}
+
+
+
+echL "DOWNRATE:$DOWNRATE UPRATE:$UPRATE"
+#echL "DOWNLINK:$DOWNLINK UPLINK:$UPLINK"
+
+
+
+
+
+
+
+
+UDPBULKPT="51413"
+TCPBULKPT="51413,6881:6889"
+
+
+
+
+
+
+
+
+
+
+
+WASHDSCPUP="yes"
+WASHDSCPDOWN="yes"
+
+
+WAN="$IFACE" #MODDED
+
+
+
+
+
+
+
+
+
+
+
+## downgrade torrents etc UDP:
+ipt64dscp -p udp -m multiport --sports "$UDPBULKPT" -j DSCP --set-dscp-class CS1
+ipt64dscp -p udp -m multiport --dports "$UDPBULKPT" -j DSCP --set-dscp-class CS1
+## downgrade torrents etc TCP:
+ipt64dscp -p tcp -m multiport --sports "$TCPBULKPT" -j DSCP --set-dscp-class CS1
+ipt64dscp -p tcp -m multiport --dports "$TCPBULKPT" -j DSCP --set-dscp-class CS1
+
+
+
+
+
+
+
+## allow up to 5 binary divisions of ack packets (32x reduction). This
+## still leads to about 1300 acks/second for a full gigabit download
+## on one stream, but it always gives each stream at least 100
+## acks/second which should normally be plenty? That's one ack every
+## 10ms, but if not we can maybe tune this up a little
+
+ackrate=300
+#!!! WAN="$IFACE" #MODDED
+#ipt64dscp -p tcp -m tcp --tcp-flags ACK ACK -o $WAN -m length --length 1:100 -m hashlimit --hashlimit-mode srcip,srcport,dstip,dstport --hashlimit-name ackfilter1 --hashlimit-above "${ackrate}/second" --hashlimit-burst $ackrate --hashlimit-rate-match --hashlimit-rate-interval 1 -m statistic --mode random --probability .5 -j DROP
+#ipt64dscp -p tcp -m tcp --tcp-flags ACK ACK -o $WAN -m length --length 1:100 -m hashlimit --hashlimit-mode srcip,srcport,dstip,dstport --hashlimit-name ackfilter2 --hashlimit-above "$((ackrate*2))/second" --hashlimit-burst $ackrate --hashlimit-rate-match --hashlimit-rate-interval 1 -m statistic --mode random --probability .5 -j DROP
+#ipt64dscp -p tcp -m tcp --tcp-flags ACK ACK -o $WAN -m length --length 1:100 -m hashlimit --hashlimit-mode srcip,srcport,dstip,dstport --hashlimit-name ackfilter3 --hashlimit-above "$((ackrate*4))/second" --hashlimit-burst $ackrate --hashlimit-rate-match --hashlimit-rate-interval 1 -m statistic --mode random --probability .5 -j DROP
+#ipt64dscp -p tcp -m tcp --tcp-flags ACK ACK -o $WAN -m length --length 1:100 -m hashlimit --hashlimit-mode srcip,srcport,dstip,dstport --hashlimit-name ackfilter4 --hashlimit-above "$((ackrate*8))/second" --hashlimit-burst $ackrate --hashlimit-rate-match --hashlimit-rate-interval 1 -m statistic --mode random --probability .5 -j DROP
+#ipt64dscp -p tcp -m tcp --tcp-flags ACK ACK -o $WAN -m length --length 1:100 -m hashlimit --hashlimit-mode srcip,srcport,dstip,dstport --hashlimit-name ackfilter5 --hashlimit-above "$((ackrate*16))/second" --hashlimit-burst $ackrate --hashlimit-rate-match --hashlimit-rate-interval 1 -m statistic --mode random --probability .5 -j DROP
+################# ^gamingonly
+
+
+
+
+
+
+
+
+
+
+
+
+CS_CONTROL=${CS_CONTROL:-CS5}
+
+
+#O> same as LATSENS(CS5)>?--sport 53 -j DSCP --set-dscp-class CS4
+
+
+
+
+
+
+
+
+
+## boost jitsi meet udp to CS4, if bandwidth video conferences to CS5 and make it realtime
+## can interfere with other realtime/game CS4~enough
+ipt64dscp -p udp --dport 10000 -j DSCP --set-dscp-class CS4
+ipt64dscp -p udp --sport 10000 -j DSCP --set-dscp-class CS4
+
+
+
+
+
+
+#######UPPERRULE
+$IPTABLES -t mangle -A QOS_MARK_F_${IFACE} -p udp -m udp -m set --match-set Zoom4 dst -m multiport --dports 8801:8810 -j DSCP --set-dscp-class CS3
+#-m comment --comment "Zoom CS3 VI"
+
+
+
+
+
+
+
+
+
+## boost zoom to CS4
+ipt64dscp -p udp -m multiport --sports 3478:3479,8801:8802 -j DSCP --set-dscp-class CS4 -m comment --comment "STATIX-Zoom-s-CS4"
+ipt64dscp -p udp -m multiport --dports 3478:3479,8801:8802 -j DSCP --set-dscp-class CS4 -m comment --comment "STATIX-Zoom-d-CS4"
+
+
+
+
+## boost google meet CS4
+ipt64dscp -p udp -m multiport --sports 19302:19309 -j DSCP --set-dscp-class CS4
+ipt64dscp -p udp -m multiport --dports 19302:19309 -j DSCP --set-dscp-class CS4
+
+
+## boost webex to CS4
+ipt64dscp -p udp --dport 9000 -j DSCP --set-dscp-class CS4
+ipt64dscp -p udp --sport 9000 -j DSCP --set-dscp-class CS4
+
+
+
+## boost teamviewer to CS4
+ipt64dscp -p udp --dport 5938 -j DSCP --set-dscp-class CS4
+ipt64dscp -p udp --sport 5938 -j DSCP --set-dscp-class CS4
+ipt64dscp -p tcp --dport 5938 -j DSCP --set-dscp-class CS4
+ipt64dscp -p tcp --sport 5938 -j DSCP --set-dscp-class CS4
+
+
+
+
+
+
+
+################## boost DNS traffic
+#ipt4dscp -p udp --dport 53 -j DSCP --set-dscp-class CS4
+#ipt4dscp -p udp --sport 53 -j DSCP --set-dscp-class CS4
+#UDPCONTROLPT="53,123"
+#TCPCONTROLPT="53,22:22" #123fakesample
+
+
+
+
+#set -x
+
+ipt64dscp -p udp -m multiport --sports "$UDPCONTROLPT" -j DSCP --set-dscp-class ${CS_CONTROL} -m comment --comment "STX-UDPCTRL-s-$CS_CONTROL"
+ipt64dscp -p udp -m multiport --dports "$UDPCONTROLPT" -j DSCP --set-dscp-class ${CS_CONTROL} -m comment --comment "STX-UDPCTRL-s-$CS_CONTROL"
+
+
+ipt64dscp -p tcp -m multiport --sports "$TCPCONTROLPT" -j DSCP --set-dscp-class ${CS_CONTROL} -m comment --comment "STX-TCPCTRL-s-$CS_CONTROL"
+ipt64dscp -p tcp -m multiport --dports "$TCPCONTROLPT" -j DSCP --set-dscp-class ${CS_CONTROL} -m comment --comment "STX-TCPCTRL-d-$CS_CONTROL"
+
+
+
+#set +x
+
+
+#$IP6TABLES -t mangle -I QOS_MARK_F_${IFACE} -p udp -m multiport --ports 53,5353,123 -j DSCP --set-dscp-class AF31 -m comment --comment "DNS and NTP in CS5 (UDP)"
+#ipt64dscp -p udp -m multiport --sports 3478:3479,8801:8802 -j DSCP --set-dscp-class CS4
+#ipt64dscp -p udp -m multiport --dports 3478:3479,8801:8802 -j DSCP --set-dscp-class CS4
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#SUBNET='10.2.3.1/24' @@@+-dSUBNET
+ipt4dscp -p tcp -s $SUBNET -m multiport --sports "80:443" -j DSCP --set-dscp-class ${CS_CONTROL}
+#ipt4dscp -p tcp -d $SUBNET -m multiport --dports "80:443" -j DSCP --set-dscp-class CS4
+ipt4dscp -p tcp -d $SUBNET -m multiport --sports "80:443" -j DSCP --set-dscp-class ${CS_CONTROL}
+
+
+#?$IPTABLES -t mangle -A POSTROUTING -p tcp -s $SUBNET -m multiport --sports "80:443" -j DSCP --set-dscp-class CS4
+#?$IPTABLES -t mangle -A POSTROUTING -p tcp -d $SUBNET -m multiport --dports "80:443" -j DSCP --set-dscp-class CS4
+
+
+
+
+
+
+
+#LAN-DNS?->ALREADY-A-RULE-FOR-THIS
+#ipt4dscp -p udp -s $SUBNET -m multiport --sports "53:5353" -j DSCP --set-dscp-class CS5
+#ipt4dscp -p udp -d $SUBNET -m multiport --sports "53:5353" -j DSCP --set-dscp-class CS5
+
+
+
+#@@@ dports? this never matches
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CS_LAT=${CS_LAT:-CS5}
+#O>CS5@>CS4>!AF41@GAMING
+for dir in src dst ; do
+    ipt4dscp -p udp -m set --match-set "latsens" $dir -j DSCP --set-dscp-class ${CS_LAT}
+    ipt6dscp -p udp -m set --match-set "latsens6" $dir -j DSCP --set-dscp-class ${CS_LAT}
+done
+#ipt4dscp -p udp -m set --match-set "realtimeset4" $dir -j DSCP --set-dscp-class CS5
+#ipt6dscp -p udp -m set --match-set "realtimeset6" $dir -j DSCP --set-dscp-class CS5
+
+
+
+CS_BULK=${CS_BULK:-CS2}
+#O>CS2@>CS1
+for proto in udp tcp ; do ##################################down prioritize low priority machines, tcp and udp:
+    for dir in src dst ; do
+	ipt4dscp -p $proto -m set --match-set "bulk" $dir -j DSCP --set-dscp-class ${CS_BULK}
+	ipt6dscp -p $proto -m set --match-set "bulk6" $dir -j DSCP --set-dscp-class ${CS_BULK}
+    done
+done
+#ipt4dscp -p $proto -m set --match-set "lowprioset4" $dir -j DSCP --set-dscp-class CS2
+#ipt6dscp -p $proto -m set --match-set "lowprioset6" $dir -j DSCP --set-dscp-class CS2
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## downgrade-UDP-tagged-CS5 sends-moret-450 pps
+## unlikely to be gaming traffic, more likely QUIC) comment this out or change to CS1 to further down-priority
+# if your game "likes" when you have low bandwidth, this can cause you
+# to "escape" the bandwidth limits, so comment it out
+####### TESTWITHTHESEOFF
+#ORIGINAL ipt4dscp -p udp -m dscp --dscp-class CS5 -m hashlimit --hashlimit-mode srcip,srcport,dstip,dstport --hashlimit-name udpbulk4 --hashlimit-above 450/second --hashlimit-burst 50 --hashlimit-rate-match --hashlimit-rate-interval 1 -j DSCP --set-dscp-class CS2
+#ORIGINALcopy>ADD-6###
+#ipt6dscp -p udp -m dscp --dscp-class CS5 -m hashlimit --hashlimit-mode srcip,srcport,dstip,dstport --hashlimit-name udpbulk4 --hashlimit-above 450/second --hashlimit-burst 50 --hashlimit-rate-match --hashlimit-rate-interval 1 -j DSCP --set-dscp-class CS2
+
+
+
+
+
+
+#ADD-SET@gameips+CS?TEST######## #@@@+ipsetgamedevice||gamedeviceabove+dscp0 NOGOODINTHISCHAIN-ifALLDS0
+#ADD-SET@gameips+CS?TEST######## #@@@+ipsetgamedevice||gamedeviceabove+dscp0 NOGOODINTHISCHAIN-ifALLDS0
+#ADD-SET@gameips+CS?TEST######## #@@@+ipsetgamedevice||gamedeviceabove+dscp0 NOGOODINTHISCHAIN-ifALLDS0
+#ADD-SET@gameips+CS?TEST######## #@@@+ipsetgamedevice||gamedeviceabove+dscp0 NOGOODINTHISCHAIN-ifALLDS0
+#ADD-SET@gameips+CS?TEST######## #@@@+ipsetgamedevice||gamedeviceabove+dscp0 NOGOODINTHISCHAIN-ifALLDS0
+
+#srconlyfornow
+
+ipt6dscp -p udp -m set --match-set "gamingdevice6" src -m dscp --dscp-class CS5 -m hashlimit --hashlimit-mode srcip,srcport,dstip,dstport --hashlimit-name gameDG61 --hashlimit-above 450/second --hashlimit-burst 50 --hashlimit-rate-match --hashlimit-rate-interval 1 -j DSCP --set-dscp-class CS2 -m comment --comment "GAMEDOWNGRADE4-CS5toCS2"
+ipt4dscp -p udp -m set --match-set "gamingdevice4" src -m dscp --dscp-class CS5 -m hashlimit --hashlimit-mode srcip,srcport,dstip,dstport --hashlimit-name gameDG41 --hashlimit-above 450/second --hashlimit-burst 50 --hashlimit-rate-match --hashlimit-rate-interval 1 -j DSCP --set-dscp-class CS2 -m comment --comment "GAMEDOWNGRADE6-CS5toCS2"
+
+
+
+
+
+#ADD-SET@gameips+CS?TEST######## #@@@+ipsetgamedevice||gamedeviceabove+dscp0 NOGOODINTHISCHAIN-ifALLDS0
+#ADD-SET@gameips+CS?TEST######## #@@@+ipsetgamedevice||gamedeviceabove+dscp0 NOGOODINTHISCHAIN-ifALLDS0
+#ADD-SET@gameips+CS?TEST######## #@@@+ipsetgamedevice||gamedeviceabove+dscp0 NOGOODINTHISCHAIN-ifALLDS0
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#############################################################################
+## movie streaming such as DASH protocol opens a connection and jams
+## packets in it and then closes it, this causes potentially big
+## problems on slower lines where it might take 100% of download for a
+## few hundred milliseconds, but we can identify it because they're
+## short lived...
+#####################
+## on the other hand, this might also cause problems for browsing as
+## it will down-prioritize the first few seconds of transfer ... it's
+## experimental
+####################### down prioritize downloads with less than 500ms of transfer to CS2
+#ipt64dscp -p tcp -m connbytes --connbytes 0:$((DOWNRATE*500/8)) --connbytes-dir reply --connbytes-mode bytes -j DSCP --set-dscp-class CS2
+######################### big transfers can be identified by their transferred bytes:
+######################### down prioritize downloads that have transferred more than 10 seconds worth of packets
+#ipt64dscp -p tcp -m connbytes --connbytes $((DOWNRATE*10000/8)) --connbytes-dir reply --connbytes-mode bytes -j DSCP --set-dscp-class CS1
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#######################################################################################################
+#0x0 already
+#ipt64dscp -p tcp -m multiport --ports 443,80 -m connbytes --connbytes 0:$((DOWNRATE*500/8)) --connbytes-dir reply --connbytes-mode bytes -j DSCP --set-dscp-class CS2
+###
+#ipt64dscp -p tcp -m multiport --ports 443,80 -m dscp --dscp-class CS2 -m connbytes --connbytes $((DOWNRATE*10000/8)) --connbytes-dir reply --connbytes-mode bytes -j DSCP --set-dscp-class CS1
+############
+#ipt -t mangle -A QOS_MARK_D_${IFACE} -p tcp -m multiport --ports 443,80 -m dscp ! --dscp-class CS2 -m connbytes --connbytes $((DOWNRATE*10000/8)) --connbytes-dir reply --connbytes-mode bytes -j DSCP --set-dscp-class CS0
+###
+#ipt64dscp -p tcp -m multiport --ports 443,80 -m connbytes \
+#    --connbytes 0:$((DOWNRATE*50/8)) --connbytes-dir reply --connbytes-mode bytes -j DSCP --set-dscp-class CS2
+#ipt -t mangle -I QOS_MARK_D_${IFACE} -p tcp -m multiport --ports 443,80 -m dscp --dscp-class CS2 -m connbytes \
+#    --connbytes $((DOWNRATE*100/8)) --connbytes-dir reply --connbytes-mode bytes -j DSCP --set-dscp-class CS0
+######################################################################################################################
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#####################
+#ipt4dscp -p tcp -m tcp --dport 443 -m hashlimit --hashlimit-mode srcip,srcport,dstip,dstport \
+#    --hashlimit-name httpshighprio41 --hashlimit-upto 33/second --hashlimit-burst 123 \
+#    --hashlimit-rate-match --hashlimit-rate-interval 1 -j DSCP --set-dscp-class CS4
+#ipt6dscp -p tcp -m tcp --dport 443 -m hashlimit --hashlimit-mode srcip,srcport,dstip,dstport \
+#    --hashlimit-name httpshighprio61 --hashlimit-upto 33/second --hashlimit-burst 123 \
+#    --hashlimit-rate-match --hashlimit-rate-interval 1 -j DSCP --set-dscp-class CS4
+######################
+#ipt4dscp -p tcp -m tcp --dport 443 -m dscp --dscp 0x00 \
+#    -m dscp --dscp 0x20 \
+#    -m hashlimit --hashlimit-mode srcip,srcport,dstip,dstport \
+#    --hashlimit-name httpshighprio42 --hashlimit-upto 33/second --hashlimit-burst 123 \
+#    --hashlimit-rate-match --hashlimit-rate-interval 1 -j DSCP --set-dscp-class CS2
+#ipt6dscp -p tcp -m tcp --dport 443 -m dscp --dscp 0x00 \
+#    -m dscp --dscp 0x20 \
+#    -m hashlimit --hashlimit-mode srcip,srcport,dstip,dstport \
+#    --hashlimit-name httpshighprio62 --hashlimit-upto 33/second --hashlimit-burst 123 \
+#    --hashlimit-rate-match --hashlimit-rate-interval 1 -j DSCP --set-dscp-class CS2
+#######################
+###overaboveburst@still0x00>CS2 ipt4dscp -p tcp -m tcp --dport 443 -m dscp --dscp 0x00 \
+
+
+
+
+
+
+
+#ip6tables-save -c | grep 443 | grep -v '0:0'
+#iptables-save -c | grep 443 | grep -v '0:0'
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## somegamesuseTCP-matchTCPstreamsuselesst-150pps probably-interactive-rather-than-bulk##########################################
+## somegamesuseTCP-matchTCPstreamsuselesst-150pps probably-interactive-rather-than-bulk##########################################
+## somegamesuseTCP-matchTCPstreamsuselesst-150pps probably-interactive-rather-than-bulk##########################################
+
+
+ipt4dscp -p tcp -m set --match-set "latsens" src  -m hashlimit --hashlimit-mode srcip,srcport,dstip,dstport --hashlimit-name tcphighprio4 --hashlimit-upto 150/second --hashlimit-burst 150 --hashlimit-rate-match --hashlimit-rate-interval 1 -j DSCP --set-dscp-class CS4
+ipt4dscp -p tcp -m set --match-set "latsens" dst  -m hashlimit --hashlimit-mode srcip,srcport,dstip,dstport --hashlimit-name tcphighprio4 --hashlimit-upto 150/second --hashlimit-burst 150 --hashlimit-rate-match --hashlimit-rate-interval 1 -j DSCP --set-dscp-class CS4
+
+
+ipt6dscp -p tcp -m set --match-set "latsens6" src  -m hashlimit --hashlimit-mode srcip,srcport,dstip,dstport --hashlimit-name tcphighprio6 --hashlimit-upto 150/second --hashlimit-burst 150 --hashlimit-rate-match --hashlimit-rate-interval 1 -j DSCP --set-dscp-class CS4
+ipt6dscp -p tcp -m set --match-set "latsens6" dst  -m hashlimit --hashlimit-mode srcip,srcport,dstip,dstport --hashlimit-name tcphighprio6 --hashlimit-upto 150/second --hashlimit-burst 150 --hashlimit-rate-match --hashlimit-rate-interval 1 -j DSCP --set-dscp-class CS4
+
+
+
+
+
+
+
+
+#################################################################################### icmp egress
+###$IPTABLES -t mangle -A qos_egress -p icmp -j DSCP --set-dscp-class EF
+#ipt4dscp -p icmp -j DSCP --set-dscp-class EF
+#################################################################################### tcp flags egress NEEDSEDITINGEXISTINGabove
+#$IPTABLES -t mangle -A qos_egress -p tcp -m length --length :64 -j DSCP --set-dscp-class EF
+
+
+
+
+
+
+
+
+
+
+
+
+
+###WASHIGHER all syn/rst 443 00
+#ipt4dscp -m limit --limit 1/sec -j LOG --log-prefix 'statixlow1sec' 
+#ipt6dscp -m limit --limit 1/sec -j LOG --log-prefix 'statixlow1sec' 
+#########iptables -t mangle -A POSTROUTING -m limit --limit 2/sec -m dscp --dscp 0x20 -j LOG --log-prefix 'dscp20 '
+###########iptables -t mangle -D POSTROUTING -m limit --limit 2/sec -m dscp --dscp 0x20 -j LOG --log-prefix 'dscp20 '
+
+
+
+
+
+
+
+
+
+#echo "flushing syn_flood rules"
+#iptables -F syn_flood
+#ip6tables -F syn_flood
+#$IPTABLES -D INPUT -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -m comment --comment "!fw3" -j syn_flood
+#$IP6TABLES -D INPUT -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -m comment --comment "!fw3" -j syn_flood
+
+
+
+} ############################################################### dlakelan-end
+
+
+#-m comment --comment "STX-TCPCTRL-s-$CS_ABC"
+#-m comment --comment "STX-TCPCTRL-s-$CS_ABC"
+#-m comment --comment "STX-TCPCTRL-s-$CS_ABC"
+
+
+
+
+
+
+
+
+
+sqm_prepare_script() {
+
+    do_modules
+	verify_qdisc $QDISC "cake" || return 1
+
+
+    #NONORIGINAL!!!
+    ipt_destruct 2>/dev/null
+	
+    ipt_setup
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+###########################################################################
+
+
+
+
+
+
+
+
+##########################################################################
+#tcpdump -i any -v '((ip[1] & 0xfc) >> 2 == [hex-value of dscp code])'
+#tcpdump -i any -v '((ip[1] & 0xfc) >> 2 == 0x1a) && udp src port 5060' #AF31
+##########################################################################
+# ------------------------------------------------------------------
+#   |   Service     |  DSCP   |    DSCP     |       Application        |
+#   |  Class Name   |  Name   |    Value    |        Examples          |
+#   |===============+=========+=============+==========================|
+#   |Network Control|  CS6    |   110000    | Network routing          |
+#   |---------------+---------+-------------+--------------------------|
+#   | Telephony     |   EF    |   101110    | IP Telephony bearer      |
+#   |---------------+---------+-------------+--------------------------|
+#   |  Signaling    |  CS5    |   101000    | IP Telephony signaling   |
+#   |---------------+---------+-------------+--------------------------|
+#   | Multimedia    |AF41,AF42|100010,100100|   H.323/V2 video         |
+#   | Conferencing  |  AF43   |   100110    |  conferencing (adaptive) |
+#   |---------------+---------+-------------+--------------------------|
+#   |  Real-Time    |  CS4    |   100000    | Video conferencing and   |
+#   |  Interactive  |         |             | Interactive gaming       |
+#   |---------------+---------+-------------+--------------------------|
+#   | Multimedia    |AF31,AF32|011010,011100| Streaming video and      |
+#   | Streaming     |  AF33   |   011110    |   audio on demand        |
+#   |---------------+---------+-------------+--------------------------|
+#   |Broadcast Video|  CS3    |   011000    |Broadcast TV & live events|
+#   |---------------+---------+-------------+--------------------------|
+#   | Low-Latency   |AF21,AF22|010010,010100|Client/server transactions|
+#   |   Data        |  AF23   |   010110    | Web-based ordering       |
+#   |---------------+---------+-------------+--------------------------|
+#   |     OAM       |  CS2    |   010000    |         OAM&P            |
+#   |---------------+---------+-------------+--------------------------|
+#   |High-Throughput|AF11,AF12|001010,001100|  Store and forward       |
+#   |    Data       |  AF13   |   001110    |     applications         |
+#   |---------------+---------+-------------+--------------------------|
+#   |    Standard   | DF (CS0)|   000000    | Undifferentiated         |
+#   |               |         |             | applications             |
+#   |---------------+---------+-------------+--------------------------|
+#   | Low-Priority  |  CS1    |   001000    | Any flow that has no BW  |
+#   |     Data      |         |             | assurance                |
+#    ------------------------------------------------------------------
+##################################################################################
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#curl -L https://raw.githubusercontent.com/ldir-EDB0/sqm-scripts/exp/src/ctinfo_4layercake.qos > /usr/lib/sqm/ctinfo_4layercake.qos
+
+
+
+
+
+#@@@ functions.sh /var/run/xtables.lock
+#Tue Jan 26 08:36:10 2021 user.notice SQM: ERROR: cmd_wrapper: ip6tables: FAILURE (4): /usr/sbin/ip6tables -t mangle -A QOS_MARK_D_repl_eth1 -m connbytes --connbytes 63675000 --connbytes-dir reply --connbytes-mode bytes -g QOS_MARK_D_eth1
+#Tue Jan 26 08:36:10 2021 user.notice SQM: ERROR: cmd_wrapper: ip6tables: LAST ERROR: Another app is currently holding the xtables lock. Perhaps you want to use the -w option?
+
+
+
+
+
+
+
+
+
+
+
+
+#THEBASEBITS
+
+
+
+
+

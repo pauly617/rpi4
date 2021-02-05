@@ -121,10 +121,6 @@
 
 
 
-
-
-
-
 ##############ORIGINAL
 . /lib/functions/network.sh
 . ${SQM_LIB_DIR}/defaults.sh
@@ -145,10 +141,6 @@ EGRESS_CAKE_OPTS="diffserv8" #EGRESS_CAKE_OPTS="diffserv4"
 
 
 
-#/usr/lib/sqm/defaults.sh:[ -z "$TARGET"  ] && TARGET="5ms"
-
-
-
 
 network_get_subnet SUBNET lan
 network_find_wan6 ifc_wan6 && network_get_prefix6 PREFIX "${ifc_wan6}"
@@ -161,26 +153,14 @@ network_find_wan6 ifc_wan6 && network_get_prefix6 PREFIX "${ifc_wan6}"
 
 
 
-
-
-
-
-
-
-
-
-
 egress() {
 
-    
-    
-    
     
     SILENT=1 $TC qdisc del dev $IFACE root
     $TC qdisc add dev $IFACE root cake bandwidth ${UPLINK}kbit \
 	    $( get_cake_lla_string ) ${EGRESS_CAKE_OPTS} ${EQDISC_OPTS}
 
-    echo "$TC qdisc add dev $IFACE root cake bandwidth ${UPLINK}kbit \
+    [ -n "$DEBUG" ] && echo "$TC qdisc add dev $IFACE root cake bandwidth ${UPLINK}kbit \
 	    $( get_cake_lla_string ) ${EGRESS_CAKE_OPTS} ${EQDISC_OPTS}"
 
 
@@ -195,8 +175,6 @@ egress() {
     $TC filter add dev $IFACE protocol all u32 \
 	match u32 0 0 \
 	action ctinfo dscp 0xfc000000 0x02000000
-
-
 
 
 }
@@ -223,9 +201,9 @@ ingress() {
 
     $TC qdisc add dev $DEV root cake bandwidth ${DOWNLINK}kbit \
 	    $( get_cake_lla_string ) ${INGRESS_CAKE_OPTS} ${IQDISC_OPTS}
-    
-    
-    echo "$TC qdisc add dev $DEV root cake bandwidth ${DOWNLINK}kbit \
+
+
+    [ -n "$DEBUG" ] && echo "$TC qdisc add dev $DEV root cake bandwidth ${DOWNLINK}kbit \
 	    $( get_cake_lla_string ) ${INGRESS_CAKE_OPTS} ${IQDISC_OPTS}"
 
 
@@ -255,35 +233,6 @@ ingress() {
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 ipset_do() {
 
     local listCOUNT=
@@ -291,26 +240,27 @@ ipset_do() {
     case "$1" in
     flush)
 
-        if ! ipset -n list | grep -q "^${2}$"; then
-            echL "Flushing $2 [nolist]"; return 0
-        fi
-
+        if ! ipset -n list | grep -q "^${2}$"; then echL "Flushing $2 [nolist]"; return 0; fi
 
         listCOUNT=$(ipset -L "${2}" 2>/dev/null | grep -A6000 'Members' 2>/dev/null | grep -v '^Members:' | wc -l)
         if [ "$listCOUNT" -gt 0 ]; then
-            echL "Flushing $2 [$listCOUNT]"
-            ipset flush $2
+            echL "Flushing $2 [$listCOUNT]"; ipset flush $2
         else
-            #echL "Flushing $2 [${listCOUNT}-noentries]"
             [ -n "$DEBUG" ] && echL "Flushing $2 [${listCOUNT}-noentries]"
         fi
-        #if [ "$(ipset -L "${2}" 2>/dev/null | grep -A6000 'Members' 2>/dev/null | wc -l)" -gt 0 ]; then
-        #    listCOUNT=$(ipset -L "${2}" 2>/dev/null | grep -A6000 'Members' 2>/dev/null | wc -l)
     ;;
     esac
 
 
 }
+
+#if [ "$(ipset -L "${2}" 2>/dev/null | grep -A6000 'Members' 2>/dev/null | wc -l)" -gt 0 ]; then
+#    listCOUNT=$(ipset -L "${2}" 2>/dev/null | grep -A6000 'Members' 2>/dev/null | wc -l)
+
+
+
+
+
 
 
 
@@ -325,20 +275,14 @@ ipset_do() {
 dynamicipset_setup() { #!NB: veth0? vs eth0?
 
 
-	#local sLBL="wasconsoles" #local sLBL="monuncommon"
 
-	local FN="dynamicipset_setup"
-
+	local FN="dynamicipset_setup" #local sLBL="wasconsoles" #local sLBL="monuncommon"
 	#echL "$FN> populate $sLBL*traf ipsets LEARNCONNECTIONS:${DSCPMONLEARNCONNECTIONS:-off}"; sleep ${RCSLEEP:-0}
 
 
 
+    if [ "$1" = "flush" ]; then ###############################################################################
 
-
-    if [ "$1" = "flush" ]; then
-
-
-        ###############################################################################
         while read THIS RULE; do
             [ -z "$RULE" ] && continue
             [ -n "$DEBUG" ] && echL "iptables -t mangle -D $RULE"
@@ -417,17 +361,10 @@ PPP
 		
 		#echL "${sLBL}mac: DSCPMONMACS $DSCPMONMACS [learn-ips-6+4]" msg; #sleep 2
 	    #TOPPRINT echL "$FN> populate $sLBL*traf ipsets LEARNCONNECTIONS:${DSCPMONLEARNCONNECTIONS:-off}"; sleep ${RCSLEEP:-0}
-
 		for cMAC in $DSCPMONMACS; do
 
-
-			#echL "${sLBL}mac: $cMAC [learn-ips]" msg; #sleep 1
-			#echL "${sLBL}mac: $cMAC [learn-ips-4]" msg
-            # | cut -c1-11
-			#echL "${sLBL}mac: $cMAC [learn-ips]"
+			#echL "${sLBL}mac: $cMAC [learn-ips]" msg; #sleep 1 #echL "${sLBL}mac: $cMAC [learn-ips-4]" msg 
             echL "${sLBL}mac: $(echo $cMAC | cut -c1-11) [learn-ips]"
-
-
 
 
 			iptables -t mangle -D PREROUTING -m conntrack --ctstate NEW \
@@ -452,13 +389,6 @@ PPP
 
 
 
-    ###############################################################################
-    #ipt -t mangle -N QOS_MACLEARN
-    #ipt -A PREROUTING -m conntrack --ctstate NEW -j QOS_MACLEARN
-    ############################################
-    #ipt -t mangle -A QOS_MACLEARN -m mac --mac-source AA:BB:CC:DD:EE:FF -j SET --add-set gamingdevice src --exist
-    ############################################
-    #ipt -t mangle -F QOS_MACLEARN
 
 
 
@@ -466,8 +396,7 @@ PPP
 
 
 
-	#DSCPMONIPS_4="10.2.3.220"
-	if [ ! -z "$DSCPMONIPS_4" ]; then
+	if [ ! -z "$DSCPMONIPS_4" ]; then #DSCPMONIPS_4="10.2.3.220"
         echL "${sLBL}mac: DSCPMONIPS_4 $DSCPMONIPS_4 [learn-ips-6+4]" msg; #sleep 2
 		for cIP4 in $DSCPMONIPS_4; do
 			echL "ipsetadd ipset add ${sLBL}4 $cIP4"; #sleep 1
@@ -1738,7 +1667,6 @@ echL "THRESH CONNBDN:$CONNBDN CONNBUP:$CONNBUP"
 
 
 
-#@@@??? /usr/lib/sqm/functions.sh:    # either e.g. 100ms or auto
 
 
 
@@ -3901,5 +3829,20 @@ sqm_prepare_script() {
 
 
 
+#/usr/lib/sqm/defaults.sh:[ -z "$TARGET"  ] && TARGET="5ms"
+#@@@??? /usr/lib/sqm/functions.sh:    # either e.g. 100ms or auto
+    
+
+
+
+
+
+    ###############################################################################
+    #ipt -t mangle -N QOS_MACLEARN
+    #ipt -A PREROUTING -m conntrack --ctstate NEW -j QOS_MACLEARN
+    ############################################
+    #ipt -t mangle -A QOS_MACLEARN -m mac --mac-source AA:BB:CC:DD:EE:FF -j SET --add-set gamingdevice src --exist
+    ############################################
+    #ipt -t mangle -F QOS_MACLEARN
 
 

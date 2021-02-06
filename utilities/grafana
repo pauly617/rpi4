@@ -47,6 +47,9 @@ status() {
 	else
 		echo "$sepS influxd [stopped]"	
 	fi
+    
+    
+    top -b -n 1 | grep -v grep | grep -E '(influxd|grafana\-server)'
 
 	infomessage
 
@@ -62,6 +65,7 @@ cat <<EOm
     ##################################################
 
         echo "$chout" >> /etc/sysupgrade.conf
+        #actually its better if it on an external disk
 
         grafana server started at 3000 (admin:admin)
 
@@ -97,6 +101,7 @@ alprfsurl="https://dl-cdn.alpinelinux.org/alpine/v3.13/releases/aarch64/alpine-m
 		chroot $chout apk update
 		#chroot $chout apk add ntop; chroot $chout ntop --set-admin-password=admin
 
+		chroot $chout apk add vim
 		chroot $chout apk add influxdb
 		chroot $chout apk add grafana
         
@@ -176,7 +181,6 @@ boot() {
 
 
 
-
 #root@rpi-dca6325631 /usbstick44# ps wwww | grep -v grep | grep -E '(influx|grafana)'
 # 1563 root      0:02 grafana-server -homepath /usr/share/grafana/
 # 3049 root      0:01 influxd run
@@ -193,43 +197,6 @@ boot() {
 
 
 
-#/etc/rc.common: line 91: apk: not found
-#/etc/rc.common: line 96: apk: not found
-
-    ##################################################
-
-#        echo "/GRAFANA" >> /etc/sysupgrade.conf
-
-#        grafana server started at 3000 (admin:admin)
-
-
-#        NOTE: WIP @ no idea how to setup influx user/pw/db etc
-
-    ##################################################
-
-#chroot: failed to run command ‘influxd’: No such file or directory
-#chroot: failed to run command ‘grafana-server’: No such file or directory
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #!@@@apk check if -d already
 #influxd    2398    root    8u  IPv4 209394      0t0  TCP 100.92.77.184:49284->65.8.33.17:443 (ESTABLISHED)
 #create database?
@@ -238,39 +205,27 @@ boot() {
 ### needs 'install||setup' command
 ### needs 'install||setup' command
 #  75 apk add vim
-#  76 vi /etc/influxdb.conf 
-#  77 which vim
 #  78 /usr/bin/vim /etc/influxdb.conf +/collectd
-#  79 exit
-#  80 influx run &
-#  81 influxd run &
 #  82 /usr/bin/vim /etc/influxdb.conf +/usage
-#  83 exit
-#  84 influxd run &
-
-
-
+#  81 influxd run &
 # 477 ps www | grep inf
 #  478 kill -9 $(pidof influxd)
-#   479 chroot /NTOP/
 #    480 kill -9 $(pidof influxd)
-#     481 chroot /NTOP/
-
-
-
-
 
 #root@rpi-dca6325631 /usbstick43# top -b -n 1 | grep -v grep | grep -E '(influx|grafana)'
 # 3049     1 root     S     778m  42%   3   0% influxd run
 # 1563     1 root     S     750m  40%   3   0% grafana-server -homepath /usr/share/grafana/
+
 #root@rpi-dca6325631 /usbstick44# ps wwww | grep -v grep | grep -E '(influx|grafana)'
 # 1563 root      0:02 grafana-server -homepath /usr/share/grafana/
 # 3049 root      0:00 influxd run
 
+#chroot $chout ntop -u root -t 5 -d
 
 
 
-	#chroot $chout ntop -u root -t 5 -d
+
+
 
 
 

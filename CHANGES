@@ -2,7 +2,11 @@
 
     ___________________________________________________   CHANGELOG
    
-                 
+
+                 -sqm_collectd.sh respawn workaround
+                 -ISRPI4@rebootwrapperFSCKfix
+
+
      -r15673-33  -wrt.ini edit @ rc.local < banip bumpsoon
                  -argon.ipk luci step workaround @ 45-luci<uci-defaults
                 7-rpi4-official-opkg.sh+mitigate.sh(wrapper)+run-mitigate.sh@github

@@ -14,6 +14,15 @@ ALLPARAMS="${*}"
 Gbase="https://raw.github.com/wulfy23/rpi4/master/utilities"
 Bname="rpisysup.sh"
 
+
+
+#TAR="${TAR:-$(command -v tar)}"
+#grep "^$field:" < $CONTROL/control | ipkg_extract_value
+
+
+
+
+
 WGETv="wget --no-parent -q -nd -l1 -nv --show-progress " #<NOTv> WGET="wget --no-parent -nd -l1 --show-progress "
 WGETs="wget --no-parent -q -nd -l1 -nv "
 

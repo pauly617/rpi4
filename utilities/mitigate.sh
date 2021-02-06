@@ -3,10 +3,22 @@
 
 
 
-#[root@dca632 /usbstick 50°]# cat /etc/crontabs/root 
+################################[root@dca632 /usbstick 50°]# cat /etc/crontabs/root 
 #59 * * * * /bin/mitigate.sh
 #/etc/init.d/cron restart
 #cp mitigate.sh /root/tasks/daily/
+############################ Reboot at 4:30am every day Note: To avoid infinite reboot loop, wait 70 seconds
+## and touch a file in /etc so clock will be set properly to 4:31 on reboot before cron starts.
+#30 4 * * * sleep 70 && touch /etc/banner && reboot
+
+
+
+
+
+
+
+
+
 
 
 
@@ -27,6 +39,9 @@ WGETs="wget --no-parent -q -nd -l1 -nv"
 Gbase="https://raw.github.com/wulfy23/rpi4/master/utilities"
 
 
+SN=$(basename $0)
+
+
 
 
 
@@ -35,10 +50,6 @@ Gbase="https://raw.github.com/wulfy23/rpi4/master/utilities"
 fails() {
     echo "$1" && exit 1
 }
-
-
-
-
 
 
 
@@ -116,10 +127,6 @@ handleallparams() {
 
 
 
-
-
-
-
 usage() {
 
 
@@ -145,6 +152,7 @@ cat <<VVV
 
 		demo			fakeoldstuff
 	
+		-f			force (wip->redownloadwrappedfileandrmflagfiles)
 VVV
 
 }
@@ -159,19 +167,16 @@ VVV
 
 
 
-
-
-
-
+#@SN works here but not in wrapped script
 
 V() {
 
 	if [ ! -z "$VERBOSE" ] || [ ! -z "$DEBUG" ]; then #if [ ! -z "$VERBOSE" ]; then
 		if [ ! -z "$ISSCRIPT" ]; then
-			logger mitigate.sh "V: ${*}"
+			logger $SN "V: ${*}"
 		else
 
-			echo "V: ${*}" >&2
+			echo "$SN-V: ${*}" >&2
 		fi
     		
 		if [ ! -z "$QUICK" ]; then sleep 1; fi
@@ -184,11 +189,11 @@ V() {
 
 O() {
 	if [ ! -z "$ISSCRIPT" ]; then
-		logger mitigate.sh "${*}"
+		logger $SN "${*}"
 	else
 		#echo "${*}"
-		echo "> ${*}"
-		echo "O-$Dy> ${*}" > /dev/console
+		echo "$SN> ${*}"
+		echo "$SN-O-$Dy> ${*}" > /dev/console
 	fi
 	#if [ ! -z "$QUICK" ]; then sleep 1; fi
 }
@@ -198,18 +203,20 @@ O() {
 
 
 
+
+
+
+
 D() { #avoidusingthis@v||!-zDEBUG
 	if [ ! -z "$DEBUG" ]; then
 		if [ ! -z "$ISSCRIPT" ]; then
-			logger mitigate.sh "D: ${*}"
+			logger $SN "D: ${*}"
 		else
-			echo "D: ${*}" #>&2
+			echo "$SN-D: ${*}" #>&2
 		fi
 		if [ ! -z "$QUICK" ]; then sleep 1; fi
 	fi
 }
-
-
 
 
 
@@ -334,14 +341,17 @@ fi
 
 
 
-
-
 #O "running mitigations..." #sh "$BFULL" #$customParam #sh "$BFULL" $cmdParam $customParam
 
 
 
 #V echo "run> $BFULL"
-V "sh \"$BFULL\" $cmdParam $customParam"
+D "sh \"$BFULL\" $cmdParam $customParam"
+
+
+
+
+
 
 
 
@@ -350,6 +360,8 @@ V "sh \"$BFULL\" $cmdParam $customParam"
 
 
 sh "$BFULL" $cmdParam $customParam
+#########ORG sh "$BFULL" $cmdParam $customParam
+#######$BFULL $cmdParam $customParam
 
 
 

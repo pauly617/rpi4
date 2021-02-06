@@ -687,22 +687,25 @@ fi #libwolfssl24 version 4.6.0
 
 
 
-#./rpi4-official-opkg.sh list-upgradable
-#./rpi4-official-opkg.sh upgrade wpad-openssl
-#./rpi4-official-opkg.sh upgrade hostapd-common hostapd-utils
-#-28 > -29
-
-#./rpi4-official-opkg.sh upgrade wpa-cli
-
-if rpi4-official-opkg.sh list-upgradable | grep -q wpad-openssl; then ./rpi4-official-opkg.sh upgrade wpad-openssl; fi
-if rpi4-official-opkg.sh list-upgradable | grep -q hostapd-common; then ./rpi4-official-opkg.sh upgrade hostapd-common; fi
-if rpi4-official-opkg.sh list-upgradable | grep -q hostapd-utils; then ./rpi4-official-opkg.sh upgrade hostapd-utils; fi
-
-if rpi4-official-opkg.sh list-upgradable | grep -q wpa-cli; then ./rpi4-official-opkg.sh upgrade wpa-cli; fi
 
 
 
-if rpi4-official-opkg.sh list-upgradable | grep -q wget-ssl; then ./rpi4-official-opkg.sh upgrade wget-ssl; fi
+#if rpi4-official-opkg.sh list-upgradable | grep -q wpad-openssl; then ./rpi4-official-opkg.sh upgrade wpad-openssl; fi
+#if rpi4-official-opkg.sh list-upgradable | grep -q hostapd-common; then ./rpi4-official-opkg.sh upgrade hostapd-common; fi
+#if rpi4-official-opkg.sh list-upgradable | grep -q hostapd-utils; then ./rpi4-official-opkg.sh upgrade hostapd-utils; fi
+
+#if rpi4-official-opkg.sh list-upgradable | grep -q wpa-cli; then ./rpi4-official-opkg.sh upgrade wpa-cli; fi
+#if rpi4-official-opkg.sh list-upgradable | grep -q wget-ssl; then ./rpi4-official-opkg.sh upgrade wget-ssl; fi
+
+
+
+/bin/rpi4-official-opkg.sh mitigate wpad-openssl hostapd-common hostapd-utils wpa-cli
+
+/bin/rpi4-official-opkg.sh mitigate wget-ssl
+
+
+
+
 
 
 
@@ -732,6 +735,10 @@ O "init> mitigating for version: $onsysVERSION [$onsysVERSIONi] ${MITPKG:-no-pac
 if [ ! -z "$onsysVERSIONi" ] && [ "$onsysVERSIONi" = "old" ]; then
 	O "too-old to mitigate" && exit 1
 fi
+
+
+
+
 
 
 
@@ -792,18 +799,6 @@ exit 0
 
 
 
-
-
-#opkg update; opkg upgrade netifd; sleep 5; opkg upgrade odhcp6c
-
-############Then verify, that you're running fixed version.
-#opkg list-installed netifd
-#opkg list-installed odhcp6c
-################################The above command should output following:
-###netifd - 2021-01-09-c00c8335-1 - for master/snapshot
-###odhcp6c - 2021-01-09-53f07e90-16 - for master/snapshot
-#######netifd - 2021-01-09-753c351b-1 - for stable OpenWrt 19.07 release
-#######odhcp6c - 2021-01-09-64e1b4e7-16 - for stable OpenWrt 19.07 release
 
 
 
@@ -943,6 +938,77 @@ exit 0
 
 
 #https://openwrt.org/advisory/start
+
+
+
+
+
+
+
+
+
+
+#######@@@console@cron
+#run-mitigate.sh-O-20210205-0859> norun:  ffile:/tmp/run-mitigate.sh.20210205
+#run-mitigate.sh warnonly detected
+#run-mitigate.sh-O-20210205-0959> norun:  ffile:/tmp/run-mitigate.sh.20210205
+#run-mitigate.sh warnonly detected
+#run-mitigate.sh-O-20210205-1059> norun:  ffile:/tmp/run-mitigate.sh.20210205
+#run-mitigate.sh warnonly detected
+#run-mitigate.sh-O-20210205-1159> norun:  ffile:/tmp/run-mitigate.sh.20210205
+
+
+
+
+
+
+
+
+
+
+
+#./rpi4-official-opkg.sh list-upgradable
+#./rpi4-official-opkg.sh upgrade wpad-openssl
+#./rpi4-official-opkg.sh upgrade hostapd-common hostapd-utils
+#-28 > -29
+
+#./rpi4-official-opkg.sh upgrade wpa-cli
+
+
+
+
+#/bin/rpi4-official-opkg.sh upgrade --force-reinstall --force-maintainer banip luci-app-banip
+
+
+#banip - 0.3.13-1 - 0.7.0-1
+#luci-app-banip - git-20.110.55046-74da73b - git-21.035.54354-f89450f
+
+
+
+
+
+#opkg update; opkg upgrade netifd; sleep 5; opkg upgrade odhcp6c
+
+############Then verify, that you're running fixed version.
+#opkg list-installed netifd
+#opkg list-installed odhcp6c
+################################The above command should output following:
+###netifd - 2021-01-09-c00c8335-1 - for master/snapshot
+###odhcp6c - 2021-01-09-53f07e90-16 - for master/snapshot
+#######netifd - 2021-01-09-753c351b-1 - for stable OpenWrt 19.07 release
+#######odhcp6c - 2021-01-09-64e1b4e7-16 - for stable OpenWrt 19.07 release
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

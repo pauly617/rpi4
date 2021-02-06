@@ -1,10 +1,46 @@
 #!/bin/sh
 
+
+#rm /tmp/.update*; /bin/rpi-sysup-online.sh -v dlonly downgrade
+
+
 #wip >>> -q||-C @ autoscripted@luci||sysinfo.sh >>> -q = exitstatusonly -C=printlatestversion&&||-Lprintashtmlwlink?
 #-R = restorepackages
 #-v = verbose ( 1(normal) -> 2 )
 #wip -Q = quick@verbose=z||0 ( 1(normal) -> 2 )
 #-D = debug
+
+
+
+
+
+
+
+
+#[root@dca632 /tmp 47°]# rpi-sysup-online.sh -v dlonly
+#sh: -v: out of range
+#sh: -v: out of range
+#sh: -v: out of range
+#no-flavour-given@ini> FLAVOUR=stable
+#Downloading ibbuildinformation.txt...
+#/tmp/ibbuildinformation.txt      100%[=========================================================>]  10.37K  --.-KB/s    in 0.001s  
+#   flavour:stable online:2.7.15-2[older] onsys:2.7.33-2 
+#use> 'downgrade'
+
+
+
+
+
+
+
+#f7fcb1c6b94a67e3f6907a6f796356f63365e53fd0e9760ce832d71f1b4c013a  /tmp/rpi4.64-snapshot-25261-2.7.15-2-r15599-ext4-sys.img.gz
+
+#f7fcb1c6b94a67e3f6907a6f796356f63365e53fd0e9760ce832d71f1b4c013a  *rpi4.64-snapshot-25261-2.7.15-2-r15599-ext4-sys.img.gz
+
+
+
+
+
 
 
 

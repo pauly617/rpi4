@@ -10,9 +10,22 @@
 
 
 
-best tried on a new usb/mmc disk ( it is not specific to usb and makes the disk pluggable either way  )... or dd backup your mmc if you are game to sysupgrade over that... ( due to cmdline.txt being part of the backup... you'd have to update your root=PARTUUID=ABCDEFGH-02 this is not mandatory and only really help is the disk is inserted / copied to a non-mmc slot  )
+
+        UPDATE: seeing an issue with UE300 bouncing into CDROM mode on these
+                builds... early days...
+
+                smallusbdrive seems better... power/uas related...?
+                (probably both)
 
 
+
+                best tried on a new usb/mmc disk ( it is not specific to usb
+                and makes the disk pluggable either way  )... or dd backup
+                your mmc if you are game to sysupgrade over that... ( due 
+                to cmdline.txt being part of the backup... you'd have to 
+                update your root=PARTUUID=ABCDEFGH-02 this is not mandatory
+                and only really help is the disk is inserted / copied to a
+                non-mmc slot  )
 
 
 

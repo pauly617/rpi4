@@ -31,6 +31,13 @@ sepS="###########################   "
 status() {
 
 
+	if [ -d $chout ]; then
+		echo "$sepS chroot-dir: $chout [$(du -chs $chout | head -n 1 | tr -s '\t' ' ' | cut -d' ' -f 1)]"
+	else
+		echo "$sepS chroot-dir: $chout [no-dir]"
+	fi
+
+
 	if [ ! -z "$(pidof grafana-server)" ]; then
 		echo "$sepS grafana-server [running:$(pidof grafana-server)]"
 		ps wwww | grep -v grep | grep -v 'init\.d' | grep grafana
